@@ -11,45 +11,53 @@ Every current "AI memory" system is fundamentally RAG: embed text → store vect
 
 ## The Engram — The Core Unit That Doesn't Exist Yet
 
-Current systems store documents or chunks. MNEMOS stores **engrams** — cognitive memory units modeled loosely on how neuroscience describes biological memory traces. Here's the full HelixQL schema:
+Current systems store documents or chunks. MNEMOS stores **engrams** — cognitive memory units modeled loosely on how neuroscience describes biological memory traces. Here's the full schema in Rust DSL:
 
-```hql
-N::Engram {
-  episode_raw:       String,
-  semantic_vector:   Vector(1536),
-  emotional_charge:  F32,           // -1.0 to +1.0
-  importance_score:  F32,           // 0.0 to 1.0
-  decay_rate:        F32,           // Ebbinghaus parameter
-  activation_count:  U32,           // times recalled
-  timestamp:         U64,
-  engram_type:       String,        // "episodic"|"semantic"|"procedural"
-  compression_level: U8,            // 0=raw, 1=compressed, 2=crystallized
-  contradiction_flag: Bool
-}
+```rust
+// Engram — includes embedding directly on the node (no separate vector node needed)
+g().add_n("Engram", vec![
+    ("episode_raw", episode_raw),           // String — raw memory text
+    ("emotional_charge", emotional_charge), // F64 — -1.0 to +1.0
+    ("importance_score", importance_score), // F64 — 0.0 to 1.0
+    ("decay_rate", decay_rate),             // F64 — Ebbinghaus parameter
+    ("activation_count", activation_count), // I64 — times recalled
+    ("timestamp", timestamp),               // String (RFC 3339)
+    ("engram_type", engram_type),           // String — "episodic"|"semantic"|"procedural"
+    ("compression_level", compression_level), // I64 — 0=raw, 1=compressed, 2=crystallized
+    ("contradiction_flag", contradiction_flag), // bool
+    ("embedding", embedding),               // Vec<f32> — 1536-dim embedding (DIRECTLY ON NODE)
+])
 
-N::Concept {
-  name:              String,
-  semantic_vector:   Vector(1536),
-  confidence:        F32,
-  formation_date:    U64,
-  source_count:      U32
-}
+// Concept — optional centroid embedding for concept-level search
+g().add_n("Concept", vec![
+    ("name", name),                         // String
+    ("confidence", confidence),             // F64 — 0.0 to 1.0
+    ("formation_date", formation_date),     // String (RFC 3339)
+    ("source_count", source_count),         // I64 — number of linked engrams
+    ("embedding", centroid_embedding),      // Vec<f32> — OPTIONAL centroid of recalling engrams
+])
 
-N::Identity {
-  trait:             String,
-  value:             F32,
-  stability:         F32,           // resistance to change
-  last_updated:      U64
-}
-
-E::recalls {}              // Engram → Concept
-E::contradicts {}          // Engram → Engram
-E::reinforces {}           // Engram → Engram
-E::abstracts_to {}         // Engram → Concept
-E::defines {}              // Concept → Identity
-E::temporal_sequence {}    // Engram → Engram (time order)
-E::spawned_from {}         // Engram → Engram (after mitosis)
+// Identity — stable personality traits
+g().add_n("Identity", vec![
+    ("trait", trait_name),                  // String
+    ("value", value),                       // F64 — trait strength
+    ("stability", stability),               // F64 — resistance to change
+    ("last_updated", last_updated),         // String (RFC 3339)
+])
 ```
+
+**Edges (7 types — no HasVector needed):**
+```rust
+"Recalls"           // Engram → Concept
+"Contradicts"       // Engram → Engram
+"Reinforces"        // Engram → Engram
+"AbstractsTo"       // Engram → Concept
+"Defines"           // Concept → Identity
+"TemporalSequence"  // Engram → Engram (time order)
+"SpawnedFrom"       // Engram → Engram (after mitosis)
+```
+
+**Key simplification:** Embeddings are stored directly on Engram nodes. No separate `EngramVector` node or `HasVector` edge needed. Vector search returns Engram nodes directly.
 
 ---
 
@@ -108,9 +116,11 @@ The `Identity` subgraph changes slowly, with `stability` values resisting update
 
 Vector databases handle semantic similarity, while graph databases handle relationships — most AI-driven applications need both, but until now developers had to build on top of two different systems with no native way to perform queries that span both.
 
-MNEMOS needs to do, in a single atomic operation: "find engrams semantically close to this query, that have strong identity alignment, that were formed after timestamp X, that don't have contradiction flags, traversing the concept graph to include connected beliefs." That query is impossible in any separated system. In HelixDB it's one compiled HelixQL query.
+MNEMOS needs to do, in a single atomic operation: "find engrams semantically close to this query, that have strong identity alignment, that were formed after timestamp X, that don't have contradiction flags, traversing the concept graph to include connected beliefs." That query is impossible in any separated system. In HelixDB it's one compiled query using the Rust DSL.
 
-HelixDB combines graph traversal, vector search, and HelixQL — a strongly typed compiled query language — in one platform, with private-by-default deployments and authenticated query access. That last part matters for identity persistence: the AI's cognitive state is private by default, not exposed as a public endpoint.
+**Key advantage for MNEMOS:** HelixDB's vector indexes work on any node or edge property — not just special "vector nodes." This means we store embeddings **directly on Engram nodes** as a property, eliminating the need for separate vector entities and the `::In<HasVector>` traversal that would otherwise be required. The result: simpler queries, fewer entities, and faster retrieval.
+
+HelixDB combines graph traversal, vector search, and a strongly typed Rust DSL in one platform, with private-by-default deployments and authenticated query access. That last part matters for identity persistence: the AI's cognitive state is private by default, not exposed as a public endpoint.
 
 ---
 
@@ -134,14 +144,29 @@ HelixDB combines graph traversal, vector search, and HelixQL — a strongly type
 
 This is genuinely buildable today, in order:
 
-1. **Phase 1** — Deploy HelixDB locally, implement the Engram schema, write basic CRR query in HelixQL. Store and retrieve engrams with resonance scoring. This alone beats every current memory system.
+1. **Phase 1** — Set up HelixDB embedded with Rust SDK, implement the Engram schema (with embedding directly on node), write basic CRR query using Rust DSL. Store and retrieve engrams with resonance scoring. This alone beats every current memory system.
 
-2. **Phase 2** — Build the Importance Scorer (small classifier trained on your own data) and Emotional Tagger. Wire them into the ingestion pipeline.
+2. **Phase 2** — Build the Importance Scorer (small classifier trained on your own data) and Emotional Tagger. Wire them into the ingestion pipeline. Embeddings computed client-side and stored directly on Engram nodes.
 
-3. **Phase 3** — Implement the Consolidation Loop as a background Python/Rust service. Start with just decay + compression. Add contradiction detection.
+3. **Phase 3** — Implement the Consolidation Loop as a background Rust service. Start with just decay + compression. Add contradiction detection. (Note: PruneEngram no longer needs to cascade to vector nodes — it's all one node now.)
 
-4. **Phase 4** — Build Memory Mitosis. This is the hardest part — requires tracking concept complexity and splitting node embeddings correctly.
+4. **Phase 4** — Build Memory Mitosis. Cluster engram embeddings to split overloaded concepts. Optional: compute and store centroid embeddings on child concepts for faster future mitosis decisions.
 
 5. **Phase 5** — Identity Graph. Let the crystallization accumulate over real usage. After 3-6 months, the identity layer becomes genuinely meaningful.
 
-This is not a research paper. This is architecture. The tools — HelixDB, HelixQL, Python ML, Rust services — all exist right now. What's never existed is putting them together this way.
+**Optional enhancements (can be added at any phase):**
+- **Concept centroid embedding** — Store centroid on Concept nodes for concept-level search pre-filter
+- **Edge embeddings on Recalls** — Store relationship embeddings for dynamic Stimulation Layer weights
+
+This is not a research paper. This is architecture. The tools — HelixDB 3.0.0 Rust SDK, Python ML, Rust services — all exist right now. What's never existed is putting them together this way.
+
+---
+
+## Related Documentation
+
+- [Integration Guide](./helixdb-embedded-integration.md) — SDK setup, client init, storage backends
+- [Schema Definition](./helixdb-embedded-schema.md) — nodes, edges, indexes in Rust DSL
+- [Query Reference](./helixdb-embedded-queries.md) — all `#[query]` functions
+- [Retrieval Layer](./helixdb-embedded-retrieval.md) — CRR + Stimulation Layer
+- [Full Pipeline](./helixdb-embedded-pipeline.rs) — complete reference implementation
+- [Vector Storage Comparison](./helixdb-vector-direct-vs-separate-node.md) — why direct-on-node was chosen

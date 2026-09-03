@@ -8,16 +8,17 @@ Links two engrams that **contradict** each other about the same concept. When th
 
 ## Schema
 
-    E::Contradicts {
-        From: Engram,
-        To:   Engram
-    }
+```rust
+g().n(NodeRef::var("engram_a_id")).add_e("Contradicts", NodeRef::var("engram_b_id"), vec![])
+```
 
 ---
 
 ## Direction
 
-    Engram A ──Contradicts──→ Engram B
+```
+Engram A ──Contradicts──→ Engram B
+```
 
 The direction is arbitrary — contradiction is symmetric. Both engrams also get `contradiction_flag = true` set on their nodes.
 
@@ -51,16 +52,23 @@ During consolidation, contradictions can be resolved by:
 
 ---
 
-## Typical Queries
+## Typical Query Patterns
 
-    -- Get engrams that contradict this one
-    N<Engram>(id)::Out<Contradicts>
+```rust
+// Create a Contradicts edge
+g().n(NodeRef::var("engram_a_id"))
+    .add_e("Contradicts", NodeRef::var("engram_b_id"), vec![])
 
-    -- Get engrams that this one contradicts (incoming)
-    N<Engram>(id)::In<Contradicts>
+// Get engrams that contradict this one
+g().n(NodeRef::var("engram_id"))
+    .out("Contradicts")
 
-    -- Find all contradicted engrams
-    N<Engram>::WHERE(AND(
-        _::{contradiction_flag}::EQ(true),
-        EXISTS(_::Out<Contradicts>)
-    ))
+// Get engrams that this one contradicts (incoming)
+g().n(NodeRef::var("engram_id"))
+    .in("Contradicts")
+
+// Find all contradicted engrams
+g().n(NodeRef::var("engram_id"))
+    .filter_node(PropertyFilter::property("contradiction_flag").eq(true))
+    .out("Contradicts")
+```

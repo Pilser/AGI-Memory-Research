@@ -293,115 +293,161 @@ The `<memory_activation>` block gains a new attribute: `wave` and `triggered_by`
 
 ---
 
-## Implementation Phases
+## Recommended Implementation: Learnable Edge Weights (Adam + 9 params)
 
-### Phase 1 — Spreading Activation with Fixed Weights (now)
+> **This is the recommended approach.** The stimulation layer with learnable weights personalizes retrieval to each user. The complexity over fixed weights is minimal (~20 lines of code for Adam update) but the benefit is dramatic — the system learns YOUR retrieval patterns.
 
-Implements the core dynamical system with hand-tuned α weights. Integrates into `pipeline.rs` as a new `stimulate_memories()` method that replaces the inner logic of `retrieve_memories()`.
+### What to Build
 
-**What to build:**
-1. New HelixQL query: `StimulateGraph(query, seed_limit, max_iterations, tau, gamma)`
-   - Compiles to: SearchV seeds → multi-hop traversal through edge types → return engrams with activation metadata
-2. In `pipeline.rs`: add `stimulate_memories()` method that:
-   - Calls the new HelixQL query
-   - Runs the recurrent feedback loop (iterations 2..M) client-side using graph traversal
-   - Computes `compute_resonance()` only on surfaced engrams (post-activation, not pre)
+1. **New `stimulate_memories()` method** in the pipeline:
+   - Vector search seeds initial Engram nodes directly (no `::In<HasVector>` traversal)
+   - Runs recurrent feedback loop (iterations 2..M) client-side using graph traversal
+   - Computes resonance scoring on surfaced engrams (post-activation, not pre)
    - Groups results by activation wave
-3. New structs: `ActivationWave`, update `ResonanceResult` to include `wave` and `triggered_by`
-4. Edge weights: hardcoded α[8] array with defaults from the table above
+   - Records activation trace for learning
 
-**This is the minimal viable stimulation layer.** Even with fixed weights, the multi-hop activation fundamentally changes retrieval behavior.
+2. **New structs:**
+   - `ActivationWave` — represents one wave of activation
+   - `StimulationTrace` — records which edges contributed (for attribution)
+   - Update `ResonanceResult` to include `wave` and `triggered_by`
 
-### Phase 2 — Learnable Edge Weights (next)
+3. **Learnable edge weights:** Adam optimizer on 9 parameters (~616 bytes total)
 
-Replaces hardcoded α weights with a learned parameter matrix trained via reinforcement signals.
+### Implementation
 
-**Training signal:** "Did the LLM use this memory in its response?"
+```rust
+/// Stimulation layer configuration with learnable weights
+pub struct StimulationConfig {
+    pub seed_limit: usize,           // L: max initial seeds (default: 15)
+    pub max_iterations: usize,       // M: max spreading iterations (default: 4)
+    pub energy_decay: f64,           // γ: per-iteration decay (default: 0.75)
+    pub surfacing_threshold: f64,    // τ: min activation to propagate (default: 0.15)
+    pub learning_rate: f64,          // η: Adam learning rate (default: 0.01)
+}
 
+/// Result of one stimulation run
+pub struct StimulationResult {
+    pub waves: Vec<ActivationWave>,  // grouped by activation wave
+    pub trace: StimulationTrace,     // for learning
+}
+
+pub struct ActivationWave {
+    pub wave_number: usize,
+    pub engrams: Vec<ResonanceResult>,
+}
+
+impl MemoryPipeline {
+    /// Stimulate memories using spreading activation with learnable weights
+    pub async fn stimulate_memories(
+        &mut self,
+        query_embedding: Vec<f32>,
+        config: &StimulationConfig,
+    ) -> Result<StimulationResult, Box<dyn std::error::Error>> {
+        // Step 1: Seed phase — vector search returns Engram nodes DIRECTLY
+        let seed_request = search_engrams_full(query_embedding, config.seed_limit as i64, 0.0);
+        let seed_response = self.client.query(seed_request).send().await?;
+        let seeds: Vec<EngramCandidate> = serde_json::from_value(
+            seed_response["candidates"].clone()
+        )?;
+
+        // Initialize activation map
+        let mut activation_map: HashMap<u64, f64> = HashMap::new();
+        for seed in &seeds {
+            let semantic_sim = 1.0 - seed.distance;
+            let recency = compute_recency_weight(&seed.timestamp);
+            let emotional_boost = 1.0 + seed.emotional_charge.abs();
+            let contradiction_factor = if seed.contradiction_flag { 0.5 } else { 1.0 };
+            activation_map.insert(seed.id, semantic_sim * recency * emotional_boost * contradiction_factor);
+        }
+
+        // Step 2-4: Spreading phase with recurrent feedback
+        let mut waves: Vec<ActivationWave> = vec![];
+        let mut trace = StimulationTrace::new();
+
+        for iteration in 0..config.max_iterations {
+            let mut new_activation: HashMap<u64, f64> = HashMap::new();
+
+            for (node_id, activation) in &activation_map {
+                if *activation < config.surfacing_threshold {
+                    continue;
+                }
+
+                // Spread to neighbors via each edge type using LEARNABLE weights
+                // (queries neighbors and applies α weights from self.edge_weights)
+                // Records contributions to trace for later learning
+                // ...
+            }
+
+            // Merge + decay
+            for (node_id, act) in &activation_map {
+                activation_map.insert(*node_id, (act + new_activation.get(node_id).unwrap_or(&0.0)) * config.energy_decay);
+            }
+
+            // Capture surfaced engrams for this wave
+            let surfaced: Vec<ResonanceResult> = activation_map.iter()
+                .filter(|(_, act)| **act > config.surfacing_threshold)
+                .map(|(id, act)| {
+                    // Build ResonanceResult from cached data
+                    ResonanceResult { /* ... */ }
+                })
+                .collect();
+
+            if !surfaced.is_empty() {
+                waves.push(ActivationWave {
+                    wave_number: iteration + 1,
+                    engrams: surfaced,
+                });
+            }
+        }
+
+        // Store trace for learning (reward extracted later from LLM response)
+        self.last_stimulation_trace = Some(trace.clone());
+
+        Ok(StimulationResult { waves, trace })
+    }
+
+    /// Learn from feedback after LLM responds
+    pub async fn learn_from_feedback(
+        &mut self,
+        reward: f64,  // +1.0 to -1.0
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let trace = match &self.last_stimulation_trace {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+
+        // Compute attributions from trace
+        let (attributions, recurrent_attr) = compute_attribution(trace, reward);
+
+        // Adam update on edge weights
+        self.edge_weights.adam_update(&attributions, recurrent_attr, reward);
+
+        // Persist weights to disk
+        self.save_weights().await?;
+
+        Ok(())
+    }
+}
 ```
-Reward signal sources:
-  +1.0   LLM explicitly references the surfaced memory in its response
-  +0.5   LLM's response is consistent with the memory's content
-   0.0   Memory was surfaced but not referenced (neutral — no signal)
-  −0.5   Memory was surfaced but contradicted by LLM's response
-  −1.0   User corrects LLM — surfaced memory was wrong or irrelevant
 
-Training approach:
-  - Maintain α[8] as a learnable parameter vector
-  - After each session, compute gradient of reward w.r.t α
-  - Update α via simple SGD or Bayesian optimization
-  - α values are per-AI-agent, not global — each agent learns its own retrieval dynamics
-```
+### Why Learnable Weights?
 
-**This makes the stimulation layer adaptive.** Different AI agents with different roles (analyst vs. companion vs. tutor) learn different α profiles. An analyst might weight `AbstractsTo` higher (preferring abstracted knowledge). A companion might weight `Recalls` and `Reinforces` higher (preferring rich, interconnected episodic memories).
+| Feature | Fixed Weights | Learnable Weights (Recommended) |
+|---------|---------------|--------------------------------|
+| Personalization | None | **Adapts to each user** |
+| Complexity | Simpler | Slightly more (~20 lines Adam) |
+| Memory cost | 72 bytes | **~616 bytes** (still tiny) |
+| Compute cost | ~10μs | **~20μs** (still trivial) |
+| Outcome | Static retrieval | **Personalized retrieval dynamics** |
 
-### Phase 3 — Recurrent Chaining in HelixDB (later)
-
-Moves the feedback loop (currently client-side in Phase 1) into compiled HelixQL for speed. The multi-hop traversal with activation propagation becomes a single server-side operation.
-
-### Phase 4 — GNN Re-Ranking (advanced)
-
-Trains a lightweight Graph Neural Network on the heterogeneous graph to predict activation values directly, replacing the hand-crafted spreading formula with learned message-passing. The GNN learns:
-- Which edge types matter most for which query types
-- How node features (emotional charge, recency, activation count) interact with graph structure
-- Non-linear activation patterns that hand-crafted α weights can't capture
-
-The GNN operates as a **second pass** over surfaced candidates: after spreading activation produces candidates grouped by wave, the GNN re-ranks within each wave, potentially promoting high-quality memories from later waves above noisy ones from earlier waves.
+The learnable weights approach is the best because it makes the system adapt to YOUR usage patterns. After 47 sessions, the system learns that YOU value concept-level associations and deep chaining — fixed weights can never do that.
 
 ---
 
-## New HelixQL Query: StimulateGraph
+## Full Implementation Details
 
-This query compiles the seed phase and first spreading iteration into a single HelixDB operation:
-
-```hql
-QUERY StimulateGraph(
-    query: String,
-    seed_limit: I64,
-    activation_threshold: F32,
-    energy_decay: F32
-) =>
-    // Step 1: Seed via vector search (identical to SearchEngramsFull)
-    seed_vectors <- SearchV<EngramVector>(Embed(query), seed_limit)
-
-    // Step 2: Traverse back to engrams via HasVector edge
-    seed_engrams <- seed_vectors::In<HasVector>
-
-    // Step 3: From each seed engram, spread one hop through each edge type
-    //   3a: Spread through Recalls → Concept
-    recalled_concepts <- seed_engrams::Out<Recalls>
-
-    //   3b: Concepts spread through Defines → Identity
-    identity_activations <- recalled_concepts::Out<Defines>
-
-    //   3c: Engrams spread through Reinforces → other Engrams
-    reinforced_engrams <- seed_engrams::Out<Reinforces>
-
-    //   3d: Engrams spread through TemporalSequence → next/prev
-    temporal_next <- seed_engrams::Out<TemporalSequence>
-    temporal_prev <- seed_engrams::In<TemporalSequence>
-
-    //   3e: Concepts spread through SpawnedFrom → children
-    specialized_concepts <- recalled_concepts::Out<SpawnedFrom>
-
-    // Step 4: All activated nodes feed back into engrams
-    //   Concepts activated by Recalls → In<Recalls> returns engrams that recall them
-    secondary_engrams <- recalled_concepts::In<Recalls>
-
-    //   Also: concepts activated by AbstractsTo → In<AbstractsTo>
-    abstracted_engrams <- recalled_concepts::In<AbstractsTo>
-
-    RETURN {
-        seed_engrams: seed_engrams::{ID, episode_raw, emotional_charge, importance_score, engram_type, timestamp},
-        recalled_concepts: recalled_concepts::{ID, name, confidence},
-        reinforced_engrams: reinforced_engrams::{ID, episode_raw, emotional_charge},
-        temporal_chain: {next: temporal_next, prev: temporal_prev},
-        secondary_engrams: secondary_engrams::{ID, episode_raw, emotional_charge},
-        identity_activations: identity_activations::{trait, value, stability}
-    }
-```
-
-The client-side recurrent loop then takes these results and iterates Steps 2-4 for M iterations, computing activation values with the α weights and γ decay.
+For the complete learnable weights implementation (Adam optimizer, reward extraction, attribution engine), see:
+- [08-Learnable-Edge-Weights.md](./08-Learnable-Edge-Weights.md)
 
 ---
 
@@ -435,14 +481,13 @@ The stimulation layer models all of these properties.
 ### 2. It Uses the Exact Graph You Already Built
 
 The MNEMOS schema already encodes the relationships that biological memory uses for activation:
-- `HasVector` = semantic association pathway
 - `Recalls` + `AbstractsTo` = cortical concept pathways
 - `Reinforces` + `Contradicts` = emotional interference/resonance pathways
 - `TemporalSequence` = episodic sequence pathways
 - `SpawnedFrom` = hierarchical category pathways
 - `Defines` = slow self-model pathways
 
-Zero schema changes needed. Every edge you already create at ingestion time becomes an activation pathway at retrieval time.
+Zero schema changes needed. Every edge you already create at ingestion time becomes an activation pathway at retrieval time. The embedding is stored directly on the Engram node, so vector search returns Engram nodes directly — no `HasVector` traversal needed.
 
 ### 3. It Makes Retrieval a Consciousness-Like Process
 
@@ -499,3 +544,16 @@ The query layer answers "what should I remember about X?"
 The stimulation layer creates the experience of **remembering** — with associations, cascades, interference, and the subjective texture of recalling not just facts but the relationships between them.
 
 The architecture described here is the natural evolution of MNEMOS from a memory storage system into a memory **experience** system. It uses the same schema, the same database, the same ML models, and the same integration protocols — but it changes the retrieval runtime from a function call into a dynamical system.
+
+---
+
+## Implementation
+
+For the actual Rust DSL implementation of queries mentioned in this doc, see:
+- [Query Reference](../helixdb-embedded-queries.md)
+- [Full Pipeline](../helixdb-embedded-pipeline.rs)
+- [Retrieval Layer](../helixdb-embedded-retrieval.md)
+- [Schema Definition](../helixdb-embedded-schema.md)
+
+For learnable edge weights (the optional enhancement to this stimulation layer), see:
+- [08-Learnable-Edge-Weights.md](./08-Learnable-Edge-Weights.md)

@@ -2,31 +2,78 @@
 
 These queries are called at **ingestion time** and during **consolidation** to write nodes, vectors, and edges into the graph.
 
+> **Key simplification:** Embeddings are stored directly on `Engram` nodes (`embedding: Vec<f32>`). There is no `EngramVector` node type and no `HasVector` edge type.
+
 ---
 
 ## 1. CreateEngram
 
 ### What It Does
-Creates a bare `Engram` node with all fields manually specified. Used when you need full control over every field — but usually you want `CreateFullEngram` instead, which also creates the vector and edge atomically.
+Creates a bare `Engram` node with all fields manually specified — including the embedding vector directly on the node. Used when you need full control over every field — but usually you want `CreateFullEngram` instead, which also handles timestamp automatically.
 
 ### Parameters
 | Param | Type | Source |
 |---|---|---|
 | `episode_raw` | String | User/system input (raw memory text) |
-| `emotional_charge` | F32 | Emotional Tagger (ML) |
-| `importance_score` | F32 | Importance Scorer (ML) |
-| `decay_rate` | F32 | System (default 0.05) |
-| `activation_count` | U32 | System (0 at creation) |
+| `emotional_charge` | f64 | Emotional Tagger (ML) |
+| `importance_score` | f64 | Importance Scorer (ML) |
+| `decay_rate` | f64 | System (default 0.05) |
+| `activation_count` | i64 | System (0 at creation) |
 | `engram_type` | String | System ("episodic", "semantic", "procedural") |
-| `compression_level` | U8 | System (0 = raw) |
-| `contradiction_flag` | Boolean | System (false at creation) |
+| `compression_level` | i64 | System (0 = raw) |
+| `contradiction_flag` | bool | System (false at creation) |
+| `embedding` | Vec<f32> | Embedding model (1536 dims, computed client-side) |
 
 ### Returns
-The created Engram node (with auto-assigned ID and `timestamp: NOW`).
+The created Engram node (with auto-assigned ID and `timestamp`).
 
 ### Used By
 - Manual engram creation (testing, debugging)
 - Pipeline: not directly — use `CreateFullEngram` instead
+
+### Query Implementation
+```rust
+use helix_db::dsl::prelude::*;
+
+#[query]
+fn create_engram(
+    episode_raw: String,
+    emotional_charge: f64,
+    importance_score: f64,
+    decay_rate: f64,
+    activation_count: i64,
+    engram_type: String,
+    compression_level: i64,
+    contradiction_flag: bool,
+    embedding: Vec<f32>,
+) -> WriteBatch {
+    write_batch()
+        .var_as("engram", g().add_n("Engram", vec![
+            ("episode_raw", episode_raw),
+            ("emotional_charge", emotional_charge),
+            ("importance_score", importance_score),
+            ("decay_rate", decay_rate),
+            ("activation_count", activation_count),
+            ("timestamp", chrono::Utc::now().to_rfc3339()),
+            ("engram_type", engram_type),
+            ("compression_level", compression_level),
+            ("contradiction_flag", contradiction_flag),
+            ("embedding", embedding),
+        ]))
+        .returning(["engram"])
+}
+```
+
+### Typical Query Patterns
+```rust
+// Create a fully-specified engram with embedding
+let request = create_engram(
+    "User discussed Uganda ICT infrastructure".to_string(),
+    0.7, 0.8, 0.05, 0, "episodic".to_string(), 0, false,
+    embedding_vector,  // Vec<f32> from your embedding model
+);
+let response = client.query(request).send().await?;
+```
 
 ---
 
@@ -39,10 +86,10 @@ Creates a `Concept` node. Called by the Concept Extractor for each concept extra
 | Param | Type | Source |
 |---|---|---|
 | `name` | String | Concept Extractor (ML) |
-| `confidence` | F32 | Concept Extractor (confidence in this concept) |
+| `confidence` | f64 | Concept Extractor (confidence in this concept) |
 
 ### Returns
-The created Concept node (with auto-assigned `formation_date: NOW`, `source_count: 1`).
+The created Concept node (with auto-assigned `formation_date`, `source_count: 1`).
 
 ### Used By
 - `Pipeline.ingest_memory()` — one call per extracted concept
@@ -50,6 +97,24 @@ The created Concept node (with auto-assigned `formation_date: NOW`, `source_coun
 
 ### Important
 Before calling this, always check if the concept already exists via `GetConceptByName`. Calling this for an existing concept creates a duplicate.
+
+### Query Implementation
+```rust
+#[query]
+fn create_concept(
+    name: String,
+    confidence: f64,
+) -> WriteBatch {
+    write_batch()
+        .var_as("concept", g().add_n("Concept", vec![
+            ("name", name),
+            ("confidence", confidence),
+            ("formation_date", chrono::Utc::now().to_rfc3339()),
+            ("source_count", 1_i64),
+        ]))
+        .returning(["concept"])
+}
+```
 
 ---
 
@@ -61,79 +126,39 @@ Creates an `Identity` node — a stable personality trait.
 ### Parameters
 | Param | Type | Source |
 |---|---|---|
-| `trait` | String | System / consolidation loop |
-| `value` | F32 | Derived from concept confidence (0.0–1.0) |
-| `stability` | F32 | System (0.5 for new traits, increases with time) |
+| `trait_name` | String | System / consolidation loop |
+| `value` | f64 | Derived from concept confidence (0.0–1.0) |
+| `stability` | f64 | System (0.5 for new traits, increases with time) |
 
 ### Returns
-The created Identity node (with `last_updated: NOW`).
+The created Identity node (with `last_updated`).
 
 ### Used By
 - Identity crystallization (consolidation loop)
 - Manual identity seeding
 
----
-
-## 4. CreateEngramVectorText
-
-### What It Does
-Creates an `EngramVector` from raw text using HelixDB's built-in `Embed()` function. The embedding model (OpenAI/Gemini) converts the text to a 1536-dim vector server-side.
-
-### Parameters
-| Param | Type | Source |
-|---|---|---|
-| `content` | String | The engram's `episode_raw` text |
-
-### Returns
-The created EngramVector node.
-
-### Used By
-- Can be used standalone, but normally called indirectly via `CreateFullEngram`
-- Testing embedding quality
-
-### Requires
-`OPENAI_API_KEY` or `GEMINI_API_KEY` environment variable set. Configured embedding model in `config.hx.json`.
+### Query Implementation
+```rust
+#[query]
+fn create_identity(
+    trait_name: String,
+    value: f64,
+    stability: f64,
+) -> WriteBatch {
+    write_batch()
+        .var_as("identity", g().add_n("Identity", vec![
+            ("trait", trait_name),
+            ("value", value),
+            ("stability", stability),
+            ("last_updated", chrono::Utc::now().to_rfc3339()),
+        ]))
+        .returning(["identity"])
+}
+```
 
 ---
 
-## 5. CreateEngramVector
-
-### What It Does
-Creates an `EngramVector` from a pre-computed `[F64]` array. Use this when you have your own embedding pipeline (custom model) and want to pass the vector directly, bypassing HelixDB's `Embed()`.
-
-### Parameters
-| Param | Type | Source |
-|---|---|---|
-| `vector` | [F64] | Custom embedding model (1536 floats) |
-| `content` | String | The engram's text (metadata only) |
-
-### Returns
-The created EngramVector node.
-
-### Used By
-- Custom embedding pipelines (e.g., local ONNX model, sentence-transformers)
-- When you embed text in Rust and pass the array directly
-
----
-
-## 6. ConnectEngramVector
-
-### What It Does
-Creates a `HasVector` edge connecting an engram to its embedding vector.
-
-### Parameters
-| Param | Type | Source |
-|---|---|---|
-| `engram_id` | ID | From `CreateEngram` result |
-| `vector_id` | ID | From `CreateEngramVector` result |
-
-### Used By
-- Manual linking (rare — normally done atomically by `CreateFullEngram`)
-- Reconnecting after migration
-
----
-
-## 7. ConnectRecalls
+## 4. ConnectRecalls
 
 ### What It Does
 Creates a `Recalls` edge: Engram → Concept. "This memory mentions/recalls this concept."
@@ -141,16 +166,51 @@ Creates a `Recalls` edge: Engram → Concept. "This memory mentions/recalls this
 ### Parameters
 | Param | Type | Source |
 |---|---|---|
-| `engram_id` | ID | The engram linking to the concept |
-| `concept_id` | ID | The concept being recalled |
+| `engram_id` | u64 | The engram linking to the concept |
+| `concept_id` | u64 | The concept being recalled |
 
 ### Used By
 - `Pipeline.ingest_memory()` — one call per extracted concept
 - Mitosis — reassigning engrams to child concepts
 
+### Query Implementation
+```rust
+#[query]
+fn connect_recalls(
+    engram_id: u64,
+    concept_id: u64,
+) -> WriteBatch {
+    write_batch()
+        .var_as("edge", g()
+            .n(NodeRef::id(engram_id))
+            .add_e("Recalls", NodeRef::id(concept_id), vec![]))
+        .returning(["edge"])
+}
+```
+
+### Optional Enhancement: With Edge Embedding
+```rust
+#[query]
+fn connect_recalls_with_embedding(
+    engram_id: u64,
+    concept_id: u64,
+    relationship_embedding: Vec<f32>,
+    strength: f64,
+) -> WriteBatch {
+    write_batch()
+        .var_as("edge", g()
+            .n(NodeRef::id(engram_id))
+            .add_e("Recalls", NodeRef::id(concept_id), vec![
+                ("relationship_embedding", relationship_embedding),
+                ("strength", strength),
+            ]))
+        .returning(["edge"])
+}
+```
+
 ---
 
-## 8. ConnectContradiction
+## 5. ConnectContradiction
 
 ### What It Does
 Creates a `Contradicts` edge between two engrams that contradict each other.
@@ -158,16 +218,31 @@ Creates a `Contradicts` edge between two engrams that contradict each other.
 ### Parameters
 | Param | Type | Source |
 |---|---|---|
-| `engram_a_id` | ID | First engram |
-| `engram_b_id` | ID | Second engram (contradicts the first) |
+| `engram_a_id` | u64 | First engram |
+| `engram_b_id` | u64 | Second engram (contradicts the first) |
 
 ### Used By
 - Contradiction Detector (ML) — when opposite emotional charges found on same concept
 - Consolidation loop — batch contradiction scanning
 
+### Query Implementation
+```rust
+#[query]
+fn connect_contradiction(
+    engram_a_id: u64,
+    engram_b_id: u64,
+) -> WriteBatch {
+    write_batch()
+        .var_as("edge", g()
+            .n(NodeRef::id(engram_a_id))
+            .add_e("Contradicts", NodeRef::id(engram_b_id), vec![]))
+        .returning(["edge"])
+}
+```
+
 ---
 
-## 9. ConnectReinforcement
+## 6. ConnectReinforcement
 
 ### What It Does
 Creates a `Reinforces` edge between two engrams that support/confirm each other.
@@ -175,15 +250,30 @@ Creates a `Reinforces` edge between two engrams that support/confirm each other.
 ### Parameters
 | Param | Type | Source |
 |---|---|---|
-| `engram_a_id` | ID | Reinforcing engram |
-| `engram_b_id` | ID | Reinforced engram |
+| `engram_a_id` | u64 | Reinforcing engram |
+| `engram_b_id` | u64 | Reinforced engram |
 
 ### Used By
 - Consolidation loop — when multiple engrams about the same concept have the same emotional sign
 
+### Query Implementation
+```rust
+#[query]
+fn connect_reinforcement(
+    engram_a_id: u64,
+    engram_b_id: u64,
+) -> WriteBatch {
+    write_batch()
+        .var_as("edge", g()
+            .n(NodeRef::id(engram_a_id))
+            .add_e("Reinforces", NodeRef::id(engram_b_id), vec![]))
+        .returning(["edge"])
+}
+```
+
 ---
 
-## 10. ConnectAbstraction
+## 7. ConnectAbstraction
 
 ### What It Does
 Creates an `AbstractsTo` edge: Engram → Concept. "This memory feeds into/abstracts to this concept." Paired with every `Recalls` edge.
@@ -191,16 +281,31 @@ Creates an `AbstractsTo` edge: Engram → Concept. "This memory feeds into/abstr
 ### Parameters
 | Param | Type | Source |
 |---|---|---|
-| `engram_id` | ID | The engram |
-| `concept_id` | ID | The abstracted concept |
+| `engram_id` | u64 | The engram |
+| `concept_id` | u64 | The abstracted concept |
 
 ### Used By
 - `Pipeline.ingest_memory()` — paired with `ConnectRecalls`
 - Mitosis — reassigning abstractions to child concepts
 
+### Query Implementation
+```rust
+#[query]
+fn connect_abstraction(
+    engram_id: u64,
+    concept_id: u64,
+) -> WriteBatch {
+    write_batch()
+        .var_as("edge", g()
+            .n(NodeRef::id(engram_id))
+            .add_e("AbstractsTo", NodeRef::id(concept_id), vec![]))
+        .returning(["edge"])
+}
+```
+
 ---
 
-## 11. ConnectDefinition
+## 8. ConnectDefinition
 
 ### What It Does
 Creates a `Defines` edge: Concept → Identity. "This knowledge defines this identity trait."
@@ -208,16 +313,31 @@ Creates a `Defines` edge: Concept → Identity. "This knowledge defines this ide
 ### Parameters
 | Param | Type | Source |
 |---|---|---|
-| `concept_id` | ID | The concept crystallizing into identity |
-| `identity_id` | ID | The identity trait being defined |
+| `concept_id` | u64 | The concept crystallizing into identity |
+| `identity_id` | u64 | The identity trait being defined |
 
 ### Used By
 - Identity crystallization (consolidation loop)
 - When a concept's confidence + source_count crosses threshold
 
+### Query Implementation
+```rust
+#[query]
+fn connect_definition(
+    concept_id: u64,
+    identity_id: u64,
+) -> WriteBatch {
+    write_batch()
+        .var_as("edge", g()
+            .n(NodeRef::id(concept_id))
+            .add_e("Defines", NodeRef::id(identity_id), vec![]))
+        .returning(["edge"])
+}
+```
+
 ---
 
-## 12. ConnectTemporal
+## 9. ConnectTemporal
 
 ### What It Does
 Creates a `TemporalSequence` edge from an earlier engram to a later one, establishing chronological order.
@@ -225,16 +345,31 @@ Creates a `TemporalSequence` edge from an earlier engram to a later one, establi
 ### Parameters
 | Param | Type | Source |
 |---|---|---|
-| `earlier_id` | ID | The engram that happened first |
-| `later_id` | ID | The engram that happened after |
+| `earlier_id` | u64 | The engram that happened first |
+| `later_id` | u64 | The engram that happened after |
 
 ### Used By
 - Ingestion — links new engram to the previous most-recent engram
 - Consolidation — batch timeline ordering
 
+### Query Implementation
+```rust
+#[query]
+fn connect_temporal(
+    earlier_id: u64,
+    later_id: u64,
+) -> WriteBatch {
+    write_batch()
+        .var_as("edge", g()
+            .n(NodeRef::id(earlier_id))
+            .add_e("TemporalSequence", NodeRef::id(later_id), vec![]))
+        .returning(["edge"])
+}
+```
+
 ---
 
-## 13. ConnectSpawn
+## 10. ConnectSpawn
 
 ### What It Does
 Creates a `SpawnedFrom` edge: Parent Concept → Child Concept. "This specialized concept was spawned from this general concept."
@@ -242,29 +377,45 @@ Creates a `SpawnedFrom` edge: Parent Concept → Child Concept. "This specialize
 ### Parameters
 | Param | Type | Source |
 |---|---|---|
-| `parent_id` | ID | The parent concept (general) |
-| `child_id` | ID | The child concept (specialized, from mitosis) |
+| `parent_id` | u64 | The parent concept (general) |
+| `child_id` | u64 | The child concept (specialized, from mitosis) |
 
 ### Used By
 - Memory Mitosis Splitter — one call per child concept spawned
 
+### Query Implementation
+```rust
+#[query]
+fn connect_spawn(
+    parent_id: u64,
+    child_id: u64,
+) -> WriteBatch {
+    write_batch()
+        .var_as("edge", g()
+            .n(NodeRef::id(parent_id))
+            .add_e("SpawnedFrom", NodeRef::id(child_id), vec![]))
+        .returning(["edge"])
+}
+```
+
 ---
 
-## 14. CreateFullEngram (PRIMARY INGESTION QUERY)
+## 11. CreateFullEngram (PRIMARY INGESTION QUERY)
 
 ### What It Does
-The **main ingestion query**. Creates an engram node, embeds its text into a vector, and connects them with a `HasVector` edge — all in one atomic operation.
+The **main ingestion query**. Creates an engram node with its embedding stored directly on the node — all in one atomic operation. No separate vector node or edge needed.
 
 ### Parameters
 | Param | Type | Source |
 |---|---|---|
 | `episode_raw` | String | User/system input |
-| `emotional_charge` | F32 | Emotional Tagger |
-| `importance_score` | F32 | Importance Scorer |
-| `decay_rate` | F32 | System (0.05) |
+| `emotional_charge` | f64 | Emotional Tagger |
+| `importance_score` | f64 | Importance Scorer |
+| `decay_rate` | f64 | System (0.05) |
 | `engram_type` | String | System ("episodic") |
-| `compression_level` | U8 | System (0) |
-| `contradiction_flag` | Boolean | System (false) |
+| `compression_level` | i64 | System (0) |
+| `contradiction_flag` | bool | System (false) |
+| `embedding` | Vec<f32> | Embedding model (1536 dims) |
 
 ### Returns
 The created Engram node (ID used for subsequent edge creation).
@@ -274,7 +425,63 @@ The created Engram node (ID used for subsequent edge creation).
 - Every new memory enters through this query
 
 ### Atomic Guarantee
-If `Embed()` fails (e.g., API key missing), the engram is NOT created. If engram creation fails, the vector is NOT created. All-or-nothing.
+All steps execute in a single `write_batch()` transaction. If any step fails, the entire operation rolls back — no orphaned partial data.
+
+### Query Implementation
+```rust
+#[query]
+fn create_full_engram(
+    episode_raw: String,
+    emotional_charge: f64,
+    importance_score: f64,
+    decay_rate: f64,
+    engram_type: String,
+    compression_level: i64,
+    contradiction_flag: bool,
+    embedding: Vec<f32>,
+) -> WriteBatch {
+    write_batch()
+        // Single step: Create the Engram node WITH embedding directly on it
+        .var_as("engram", g().add_n("Engram", vec![
+            ("episode_raw", episode_raw),
+            ("emotional_charge", emotional_charge),
+            ("importance_score", importance_score),
+            ("decay_rate", decay_rate),
+            ("activation_count", 0_i64),
+            ("timestamp", chrono::Utc::now().to_rfc3339()),
+            ("engram_type", engram_type),
+            ("compression_level", compression_level),
+            ("contradiction_flag", contradiction_flag),
+            ("embedding", embedding),
+        ]))
+        .returning(["engram"])
+}
+```
+
+### Typical Query Patterns
+```rust
+// Primary ingestion: create engram with embedding in ONE call
+let embedding = embed_text("User discussed Uganda ICT infrastructure").await?;
+let request = create_full_engram(
+    "User discussed Uganda ICT infrastructure".to_string(),
+    0.7, 0.8, 0.05, "episodic".to_string(), 0, false,
+    embedding,
+);
+let response = client.query(request).send().await?;
+let engram_id: u64 = serde_json::from_value(response["engram"]["$id"].clone())?;
+```
+
+---
+
+## Eliminated Queries
+
+The following queries are **no longer needed** with direct-on-node embedding storage:
+
+| Old Query | Reason Eliminated |
+|---|---|
+| `CreateEngramVectorText` | No separate `EngramVector` node — embedding lives on `Engram` |
+| `CreateEngramVector` | Same — embeddings are a property, not a node |
+| `ConnectEngramVector` | No `HasVector` edge — embedding is already on the `Engram` |
 
 ---
 
@@ -282,15 +489,16 @@ If `Embed()` fails (e.g., API key missing), the engram is NOT created. If engram
 
 ```
 Pipeline.ingest_memory(episode_raw):
-  1. EmotionalTagger.tag(episode_raw)           → emotional_charge
-  2. ImportanceScorer.score(episode_raw)        → importance_score
-  3. CreateFullEngram(episode_raw, ...)          → engram_id
-  4. ConceptExtractor.extract(episode_raw)       → [concepts...]
-  5. For each concept:
+  1. EmotionalTagger.tag(episode_raw)              → emotional_charge
+  2. ImportanceScorer.score(episode_raw)           → importance_score
+  3. embed_text(episode_raw)                        → embedding (client-side)
+  4. CreateFullEngram(episode_raw, ..., embedding)  → engram_id
+  5. ConceptExtractor.extract(episode_raw)          → [concepts...]
+  6. For each concept:
        existing = GetConceptByName(concept.name)
        if !existing: CreateConcept(name, confidence) → concept_id
        ConnectRecalls(engram_id, concept_id)
        ConnectAbstraction(engram_id, concept_id)
        UpdateConceptSourceCount(concept_id)
-  6. ContradictionDetector.check(engram_id)     → may call ConnectContradiction
+  7. ContradictionDetector.check(engram_id)        → may call ConnectContradiction
 ```

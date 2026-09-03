@@ -8,19 +8,20 @@ Links an engram to the broader concepts it **abstracts into**. While `Recalls` m
 
 ## Schema
 
-    E::AbstractsTo {
-        From: Engram,
-        To:   Concept
-    }
+```rust
+g().n(NodeRef::var("engram_id")).add_e("AbstractsTo", NodeRef::var("concept_id"), vec![])
+```
 
 ---
 
 ## Direction
 
-    Engram ──AbstractsTo──→ Concept
+```
+Engram ──AbstractsTo──→ Concept
 
-    From: Engram    (the experience that feeds the concept)
-    To:   Concept   (the abstraction that the experience supports)
+From: Engram    (the experience that feeds the concept)
+To:   Concept   (the abstraction that the experience supports)
+```
 
 ---
 
@@ -45,11 +46,21 @@ Links an engram to the broader concepts it **abstracts into**. While `Recalls` m
 
 ## Typical Query Patterns
 
-    -- Get concepts abstracted from an engram
-    N<Engram>(id)::Out<AbstractsTo>
+```rust
+// Create an AbstractsTo edge
+g().n(NodeRef::var("engram_id"))
+    .add_e("AbstractsTo", NodeRef::var("concept_id"), vec![])
 
-    -- Get engrams that abstract to a concept
-    N<Concept>(id)::In<AbstractsTo>
+// Get concepts abstracted from an engram
+g().n(NodeRef::var("engram_id"))
+    .out("AbstractsTo")
 
-    -- Find the full abstraction chain
-    N<Engram>(id)::Out<AbstractsTo>::Out<Defines>  -- engram → concept → identity
+// Get engrams that abstract to a concept
+g().n(NodeRef::var("concept_id"))
+    .in("AbstractsTo")
+
+// Find the full abstraction chain
+g().n(NodeRef::var("engram_id"))
+    .out("AbstractsTo")
+    .out("Defines")  // engram → concept → identity
+```

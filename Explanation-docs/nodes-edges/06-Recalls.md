@@ -8,21 +8,46 @@ Links an engram to the concepts it **recalls** (references, mentions, or discuss
 
 ## Schema
 
-    E::Recalls {
-        From: Engram,
-        To:   Concept
-    }
+### Base Schema (Structural Link)
 
-No properties — a structural link.
+```rust
+g().n(NodeRef::var("engram_id")).add_e("Recalls", NodeRef::var("concept_id"), vec![])
+```
+
+### Optional Enhancement: Edge Embedding
+
+> **This is an OPTIONAL enhancement that improves the Stimulation Layer without degrading anything.**
+> Store a relationship embedding on each Recalls edge to enable dynamic edge weights.
+
+```rust
+g().n(NodeRef::var("engram_id")).add_e("Recalls", NodeRef::var("concept_id"), vec![
+    ("relationship_embedding", edge_embedding),  // Vec<f32> — how this engram relates to this concept
+    ("strength", 0.85),                          // F64 — optional strength indicator
+])
+```
+
+**How it works:**
+- When creating a Recalls edge, compute a "relationship embedding" that captures HOW this engram relates to this concept
+- This is different from the engram's own embedding (which captures WHAT the engram is about)
+- Example: An engram about "Uganda ICT hub" might relate to concept "infrastructure sovereignty" through a POLITICAL angle or TECHNICAL angle
+
+**Benefits (no degradation):**
+- **Stimulation Layer:** Enables dynamic edge weights — stronger relationships transmit more activation (more biologically plausible)
+- **Memory Mitosis:** Can cluster by relationship embeddings for more nuanced concept formation
+- **CRR:** Optional combined scoring (engram similarity × relationship strength)
+
+**Cost:** Extra storage (one embedding per edge) and computation (compute at edge creation)
 
 ---
 
 ## Direction
 
-    Engram ──Recalls──→ Concept
+```
+Engram ──Recalls──→ Concept
 
-    From: Engram    (the memory that mentions the concept)
-    To:   Concept   (the abstracted knowledge piece)
+From: Engram    (the memory that mentions the concept)
+To:   Concept   (the abstracted knowledge piece)
+```
 
 ---
 
@@ -38,12 +63,12 @@ No properties — a structural link.
 
 | Use Case | Query | Direction |
 |---|---|---|
-| **What concepts does this engram mention?** | `N<Engram>(id)::Out<Recalls>` | Forward |
-| **What engrams mention this concept?** | `N<Concept>(id)::In<Recalls>` | Backward |
-| **Cognitive chain to identity** | `N<Engram>(id)::Out<Recalls>::Out<Defines>` | Forward → Forward |
-| **Contradiction candidates** | `N<Concept>(id)::In<Recalls>` → compare emotional_charges | Backward |
-| **Mitosis clustering** | `N<Concept>(id)::In<Recalls>` → get engram embeddings | Backward |
-| **Count engrams per concept** | `N<Concept>(id)::In<Recalls>::COUNT` | Backward |
+| **What concepts does this engram mention?** | Forward traversal from Engram | Forward |
+| **What engrams mention this concept?** | Backward traversal from Concept | Backward |
+| **Cognitive chain to identity** | Engram → Recalls → Defines → Identity | Forward → Forward |
+| **Contradiction candidates** | Get engrams recalling same concept → compare emotional_charges | Backward |
+| **Mitosis clustering** | Get engrams recalling a concept → cluster their embeddings | Backward |
+| **Count engrams per concept** | Count incoming Recalls edges | Backward |
 
 ---
 
@@ -75,8 +100,57 @@ In practice, every `Recalls` edge is usually paired with an `AbstractsTo` edge, 
 
 The `source_count` on a Concept node should equal the number of incoming `Recalls` edges. The `UpdateConceptSourceCount` query syncs this:
 
-    QUERY UpdateConceptSourceCount(concept_id: ID) =>
-        concept <- N<Concept>(concept_id)
-        count <- concept::In<Recalls>::COUNT
-        updated <- concept::UpsertN({source_count: count})
-        RETURN updated
+```rust
+// UpdateConceptSourceCount — sync source_count with actual edge count
+let request = write_batch()
+    .var_as("concept", g().n(NodeRef::var("concept_id")))
+    .var_as("count", g().n(NodeRef::var("concept_id")).in("Recalls").count())
+    .var_as("updated", g().n(NodeRef::var("concept_id")).update_node(vec![
+        ("source_count", count_value),
+    ]))
+    .returning(["updated"]);
+```
+
+---
+
+## Typical Query Patterns
+
+```rust
+// Create a Recalls edge (base — no properties)
+g().n(NodeRef::var("engram_id"))
+    .add_e("Recalls", NodeRef::var("concept_id"), vec![])
+
+// Create a Recalls edge with optional relationship embedding and strength
+g().n(NodeRef::var("engram_id"))
+    .add_e("Recalls", NodeRef::var("concept_id"), vec![
+        ("relationship_embedding", edge_embedding),
+        ("strength", 0.85),
+    ])
+
+// What concepts does this engram mention?
+g().n(NodeRef::var("engram_id"))
+    .out("Recalls")
+
+// What engrams mention this concept?
+g().n(NodeRef::var("concept_id"))
+    .in("Recalls")
+
+// Cognitive chain to identity
+g().n(NodeRef::var("engram_id"))
+    .out("Recalls")
+    .out("Defines")
+
+// Contradiction candidates: get engrams recalling same concept
+g().n(NodeRef::var("concept_id"))
+    .in("Recalls")
+
+// Count engrams per concept
+g().n(NodeRef::var("concept_id"))
+    .in("Recalls")
+    .count()
+
+// Mitosis clustering: get engrams + their embeddings for a concept
+g().n(NodeRef::var("concept_id"))
+    .in("Recalls")
+    .property("embedding")
+```

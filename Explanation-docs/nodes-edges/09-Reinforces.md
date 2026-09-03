@@ -8,19 +8,20 @@ Links two engrams where one **reinforces** or supports the other. This is the op
 
 ## Schema
 
-    E::Reinforces {
-        From: Engram,
-        To:   Engram
-    }
+```rust
+g().n(NodeRef::var("engram_a_id")).add_e("Reinforces", NodeRef::var("engram_b_id"), vec![])
+```
 
 ---
 
 ## Direction
 
-    Engram A ──Reinforces──→ Engram B
+```
+Engram A ──Reinforces──→ Engram B
 
-    From: The reinforcing engram (adds support)
-    To:   The reinforced engram (receives support)
+From: The reinforcing engram (adds support)
+To:   The reinforced engram (receives support)
+```
 
 ---
 
@@ -51,3 +52,26 @@ Reinforcement detection uses the same mechanics as contradiction detection but w
 - `Reinforces` says: "engram A and engram B are saying the same thing about X"
 
 Two engrams can both have `Recalls` to the same concept without reinforcing each other (e.g., one about PostgreSQL performance, one about PostgreSQL installation — same concept, different sub-topics). `Reinforces` requires semantic similarity between the engrams themselves, not just shared concept membership.
+
+---
+
+## Typical Query Patterns
+
+```rust
+// Create a Reinforces edge
+g().n(NodeRef::var("engram_a_id"))
+    .add_e("Reinforces", NodeRef::var("engram_b_id"), vec![])
+
+// Get engrams that this one reinforces
+g().n(NodeRef::var("engram_id"))
+    .out("Reinforces")
+
+// Get engrams that reinforce this one (incoming)
+g().n(NodeRef::var("engram_id"))
+    .in("Reinforces")
+
+// Find all reinforcing engrams for a concept
+g().n(NodeRef::var("concept_id"))
+    .in("Recalls")
+    .out("Reinforces")
+```

@@ -8,19 +8,20 @@ Links a concept to an identity trait that it **defines** or shapes. This is the 
 
 ## Schema
 
-    E::Defines {
-        From: Concept,     // The knowledge that shapes identity
-        To:   Identity     // The identity trait being shaped
-    }
+```rust
+g().n(NodeRef::var("concept_id")).add_e("Defines", NodeRef::var("identity_id"), vec![])
+```
 
 ---
 
 ## Direction
 
-    Concept ──Defines──→ Identity
+```
+Concept ──Defines──→ Identity
 
-    From: Concept    (e.g., "East African tech ecosystem")
-    To:   Identity   (e.g., "knows East African tech")
+From: Concept    (e.g., "East African tech ecosystem")
+To:   Identity   (e.g., "knows East African tech")
+```
 
 ---
 
@@ -37,22 +38,24 @@ Links a concept to an identity trait that it **defines** or shapes. This is the 
 
 | Use Case | Query |
 |---|---|
-| **What identity traits does a concept define?** | `N<Concept>(id)::Out<Defines>` |
-| **What concepts define an identity trait?** | `N<Identity>(id)::In<Defines>` |
-| **Engram → Identity (full chain)** | `N<Engram>(id)::Out<Recalls>::Out<Defines>` |
+| **What identity traits does a concept define?** | Forward traversal from Concept |
+| **What concepts define an identity trait?** | Backward traversal from Identity |
+| **Engram → Identity (full chain)** | Engram → Recalls → Defines → Identity |
 | **Identity alignment scoring** | Walk chain, compute cosine sim between engram embedding and identity trait embeddings |
 
 ---
 
 ## The Full Cognitive Chain
 
-    Engram (raw memory)
-       │
-       ├── Recalls/AbstractsTo → Concept (distilled knowledge)
-       │                              │
-       │                              └── Defines → Identity (stable self-model)
-       │
-       └── Contradicts/Reinforces → Other Engrams (relationship to other memories)
+```
+Engram (raw memory)
+   │
+   ├── Recalls/AbstractsTo → Concept (distilled knowledge)
+   │                              │
+   │                              └── Defines → Identity (stable self-model)
+   │
+   └── Contradicts/Reinforces → Other Engrams (relationship to other memories)
+```
 
 This 3-layer architecture is what makes MNEMOS different from RAG:
 
@@ -68,13 +71,38 @@ This 3-layer architecture is what makes MNEMOS different from RAG:
 
 The `value` of an identity trait is derived from the concepts that define it:
 
-    For Identity{trait: "knows databases"}:
-      → In<Defines> → [Concept{name: "PostgreSQL", confidence: 0.9, source_count: 45},
-                        Concept{name: "MongoDB", confidence: 0.7, source_count: 20},
-                        Concept{name: "Redis", confidence: 0.6, source_count: 15}]
+```
+For Identity{trait: "knows databases"}:
+  → In<Defines> → [Concept{name: "PostgreSQL", confidence: 0.9, source_count: 45},
+                    Concept{name: "MongoDB", confidence: 0.7, source_count: 20},
+                    Concept{name: "Redis", confidence: 0.6, source_count: 15}]
 
-    Identity.value = weighted_avg([0.9, 0.7, 0.6], [45, 20, 15])
-                   = (0.9*45 + 0.7*20 + 0.6*15) / 80
-                   = 0.79
+Identity.value = weighted_avg([0.9, 0.7, 0.6], [45, 20, 15])
+               = (0.9*45 + 0.7*20 + 0.6*15) / 80
+               = 0.79
+```
 
 The more concepts define a trait, and the stronger those concepts are, the higher the trait's value.
+
+---
+
+## Typical Query Patterns
+
+```rust
+// Create a Defines edge
+g().n(NodeRef::var("concept_id"))
+    .add_e("Defines", NodeRef::var("identity_id"), vec![])
+
+// What identity traits does a concept define?
+g().n(NodeRef::var("concept_id"))
+    .out("Defines")
+
+// What concepts define an identity trait?
+g().n(NodeRef::var("identity_id"))
+    .in("Defines")
+
+// Engram → Identity (full chain)
+g().n(NodeRef::var("engram_id"))
+    .out("Recalls")
+    .out("Defines")
+```

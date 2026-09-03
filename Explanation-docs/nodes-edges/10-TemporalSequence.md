@@ -8,19 +8,20 @@ Links two engrams in **chronological order** — "this happened, then that happe
 
 ## Schema
 
-    E::TemporalSequence {
-        From: Engram,
-        To:   Engram
-    }
+```rust
+g().n(NodeRef::var("earlier_id")).add_e("TemporalSequence", NodeRef::var("later_id"), vec![])
+```
 
 ---
 
 ## Direction
 
-    Earlier Engram ──TemporalSequence──→ Later Engram
+```
+Earlier Engram ──TemporalSequence──→ Later Engram
 
-    From: The engram that happened first
-    To:   The engram that happened later
+From: The engram that happened first
+To:   The engram that happened later
+```
 
 ---
 
@@ -38,9 +39,9 @@ Links two engrams in **chronological order** — "this happened, then that happe
 | Use Case | Query |
 |---|---|
 | **Get timeline** | `GetTimeline(limit, offset)` — orders by timestamp DESC |
-| **What happened before this?** | `N<Engram>(id)::In<TemporalSequence>` |
-| **What happened after this?** | `N<Engram>(id)::Out<TemporalSequence>` |
-| **Trace experience chains** | `N<Engram>(id)::Out<TemporalSequence>::Out<TemporalSequence>::Out<TemporalSequence>` |
+| **What happened before this?** | Backward traversal from an Engram |
+| **What happened after this?** | Forward traversal from an Engram |
+| **Trace experience chains** | Multi-hop forward traversal |
 
 ---
 
@@ -51,3 +52,27 @@ Temporal ordering enables:
 - **Timeline queries** — "What did I experience last Tuesday?"
 - **Recency context** — Understanding what sequence of events led to a conclusion
 - **Narrative construction** — The AI can tell coherent stories about its experiences
+
+---
+
+## Typical Query Patterns
+
+```rust
+// Create a TemporalSequence edge
+g().n(NodeRef::var("earlier_id"))
+    .add_e("TemporalSequence", NodeRef::var("later_id"), vec![])
+
+// What happened before this?
+g().n(NodeRef::var("engram_id"))
+    .in("TemporalSequence")
+
+// What happened after this?
+g().n(NodeRef::var("engram_id"))
+    .out("TemporalSequence")
+
+// Trace experience chains
+g().n(NodeRef::var("engram_id"))
+    .out("TemporalSequence")
+    .out("TemporalSequence")
+    .out("TemporalSequence")
+```

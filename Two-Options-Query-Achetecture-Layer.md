@@ -23,19 +23,19 @@ The tag format is designed to be as close to natural thought as possible:
 </recall>
 ```
 
-The runtime parses this, compiles it to a HelixQL CRR query automatically:
+The runtime parses this, compiles it to a Rust DSL query automatically:
 
-```hql
-QUERY ctpRecall(q_vec: Vector, limit: U32, id_filter: Bool) =>
-  e <- V<Engram>::near(q_vec, limit * 3)
-    | WHERE e.importance_score > 0.2
-    | WHERE NOT e.contradiction_flag OR e.importance_score > 0.7
-    | RETURN e::scored_by(
-        semantic_weight: 0.4,
-        recency_weight: 0.25,
-        identity_align: id_filter ? 0.35 : 0.0
-      )::top(limit)
+```rust
+// The CTP runtime generates this query from the <recall> tag
+let request = search_engrams_full(
+    query_embedding,      // Embed(query_text)
+    limit * 3,            // oversample for resonance scoring
+    0.15,                 // min_importance
+);
+// Then applies CRR resonance scoring to the results
 ```
+
+> **Implementation:** See [helixdb-embedded-queries.md](./helixdb-embedded-queries.md) for the full `search_engrams_full` implementation and [helixdb-embedded-pipeline.rs](./helixdb-embedded-pipeline.rs) for the CRR scoring logic.
 
 The result comes back into the thinking stream as an activation block — not a tool response, not appended context. Injected directly into where the `<recall>` tag was:
 

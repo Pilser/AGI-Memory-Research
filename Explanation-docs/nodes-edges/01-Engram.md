@@ -8,19 +8,22 @@ The engram is the **fundamental unit of memory** in MNEMOS. It represents a sing
 
 ## Schema
 
-```hql
-N::Engram {
-    episode_raw:       String,     // The full raw text of the memory
-    emotional_charge:  F32,        // -1.0 (negative) to +1.0 (positive)
-    importance_score:  F32,        // 0.0 (trivial) to 1.0 (critical)
-    decay_rate:        F32,        // Ebbinghaus forgetting speed
-    activation_count:  U32,        // How many times this engram was recalled
-    timestamp:         Date,       // When the memory was formed
-    engram_type:       String,     // "episodic" | "semantic" | "procedural"
-    compression_level: U8,         // 0=raw, 1=compressed (summary only), 2=crystallized
-    contradiction_flag: Boolean    // True if this engram contradicts another
-}
+```rust
+g().add_n("Engram", vec![
+    ("episode_raw", episode_raw),           // String — raw memory text
+    ("emotional_charge", emotional_charge), // F64 — -1.0 to +1.0
+    ("importance_score", importance_score), // F64 — 0.0 to 1.0
+    ("decay_rate", decay_rate),             // F64 — Ebbinghaus parameter
+    ("activation_count", activation_count), // I64 — times recalled (use I64 for U32)
+    ("timestamp", timestamp),               // String (RFC 3339 date-time)
+    ("engram_type", engram_type),           // String — "episodic"|"semantic"|"procedural"
+    ("compression_level", compression_level), // I64 — 0=raw, 1=compressed, 2=crystallized
+    ("contradiction_flag", contradiction_flag), // bool
+    ("embedding", embedding),               // Vec<f32> — 1536-dimension embedding (DIRECTLY ON NODE)
+])
 ```
+
+**Key change:** The embedding is stored directly on the Engram node. No separate `EngramVector` node or `HasVector` edge needed.
 
 ---
 
@@ -37,13 +40,13 @@ N::Engram {
 | `engram_type` | System (based on context) | `"episodic"` (experience), `"semantic"` (knowledge), `"procedural"` (how-to). Can be promoted from episodic → semantic. |
 | `compression_level` | Consolidation Loop | `0` = full raw text. `1` = compressed (raw text cleared, summary kept). `2` = crystallized (permanent semantic memory). |
 | `contradiction_flag` | Contradiction Detector | `false` at creation. Set to `true` when a contradicting engram is detected. |
+| `embedding` | Embedding Model (at creation) | 1536-dimension `Vec<f32>` stored directly on the node. Used for semantic vector search. Remains even when `episode_raw` is cleared during compression. |
 
 ---
 
 ## Outgoing Edges (What an Engram Can Point To)
 
 ```
-Engram ──HasVector────────→ EngramVector    (its embedding)
 Engram ──Recalls──────────→ Concept         (what concepts this memory relates to)
 Engram ──AbstractsTo──────→ Concept         (what concepts this memory feeds into)
 Engram ──Contradicts──────→ Engram          (this memory contradicts another)
@@ -52,10 +55,11 @@ Engram ──TemporalSequence─→ Engram          (this memory happened before
 Engram ──SpawnedFrom──────→ Engram          (this is a child of parent memory after mitosis)
 ```
 
+> **Note:** The `HasVector` outgoing edge has been eliminated. The embedding is now stored directly on the Engram node as the `embedding` property.
+
 ## Incoming Edges (What Points to an Engram)
 
 ```
-EngramVector ──HasVector────────← Engram    (an embedding represents this engram)
 Concept      ──Recalls──────────← Engram    (this concept is recalled by engrams)
 Concept      ──AbstractsTo──────← Engram    (this concept is built from engrams)
 Engram       ──Contradicts──────← Engram    (another memory contradicts this one)
@@ -64,6 +68,8 @@ Engram       ──TemporalSequence─← Engram    (a memory happened before th
 Engram       ──SpawnedFrom──────← Engram    (another memory spawned this one via mitosis)
 ```
 
+> **Note:** The `HasVector` incoming edge from `EngramVector` has been eliminated along with the separate vector node type.
+
 ---
 
 ## What It's Used For
@@ -71,9 +77,9 @@ Engram       ──SpawnedFrom──────← Engram    (another memory sp
 | Use Case | How |
 |---|---|
 | **Memory storage** | `CreateEngram` / `CreateFullEngram` creates the node |
-| **Memory retrieval** | `SearchEngramsByText` → `SearchV` finds relevant engrams by embedding |
+| **Memory retrieval** | Vector search on `Engram.embedding` finds relevant engrams directly |
 | **Memory decay** | Consolidation loop reads `decay_rate`, `timestamp`, `activation_count` to compute retention |
-| **Memory pruning** | `DROP N<Engram>(id)` deletes forgotten engrams |
+| **Memory pruning** | Drop the Engram node — no separate vector to clean up |
 | **Memory compression** | `CompressEngram` sets `compression_level=1`, clears `episode_raw` |
 | **Memory promotion** | `PromoteToSemantic` sets `engram_type="semantic"`, `compression_level=2` |
 | **Recall tracking** | `ActivateEngram` bumps `activation_count` when retrieved |
@@ -111,7 +117,6 @@ Engram       ──SpawnedFrom──────← Engram    (another memory sp
 
 | Other Node | Via Edge(s) | Meaning |
 |---|---|---|
-| `EngramVector` | `HasVector` | This engram's semantic embedding (used for vector search) |
 | `Concept` | `Recalls` + `AbstractsTo` | What knowledge this engram contributes to |
 | `Concept` (indirectly) | `Concept → Defines → Identity` | How this engram shapes the AI's identity (2-hop traversal) |
 | `Engram` (same type) | `Contradicts` | This engram conflicts with another about the same concept |
@@ -119,29 +124,51 @@ Engram       ──SpawnedFrom──────← Engram    (another memory sp
 | `Engram` (same type) | `TemporalSequence` | Chronological ordering between experiences |
 | `Engram` (same type) | `SpawnedFrom` | Parent-child relationship after memory mitosis |
 
+> **Note:** The `EngramVector` node type and `HasVector` edge type have been eliminated. The embedding is now a direct property on the Engram node.
+
 ---
 
-## Typical Query Patterns Involving Engram
+## Typical Query Patterns
 
-```
--- Get engram by ID
-N<Engram>(engram_id)
+```rust
+// Get engram by ID
+g().n(NodeRef::var("engram_id"))
 
--- Get engram with its embedding
-N<Engram>(engram_id)::Out<HasVector>::FIRST
+// Get engram's embedding (directly on the node — no traversal needed)
+g().n(NodeRef::var("engram_id"))
+    .property("embedding")
 
--- Get all concepts this engram relates to
-N<Engram>(engram_id)::Out<Recalls>
+// Get all concepts this engram relates to
+g().n(NodeRef::var("engram_id"))
+    .out("Recalls")
 
--- Get the full cognitive chain (engram → concepts → identity)
-N<Engram>(engram_id)::Out<Recalls>::Out<Defines>
+// Get the full cognitive chain (engram → concepts → identity)
+g().n(NodeRef::var("engram_id"))
+    .out("Recalls")
+    .out("Defines")
 
--- Get engrams that contradict this one
-N<Engram>(engram_id)::Out<Contradicts>
+// Get engrams that contradict this one
+g().n(NodeRef::var("engram_id"))
+    .out("Contradicts")
 
--- Find engrams by type
-N<Engram>::WHERE(_::{engram_type}::EQ("episodic"))
+// Find engrams by type (requires secondary index on engram_type)
+g().n(NodeRef::var("engram_id"))
+    .filter_node(PropertyFilter::property("engram_type").eq("episodic"))
 
--- Count engrams by type
-N<Engram>::GROUP_BY(engram_type)
+// Vector search: find engrams semantically similar to a query embedding
+// (requires vector index on Engram.embedding)
+g().vector_search_with(
+    "Engram",
+    "embedding",
+    query_embedding,
+    NonZeroUsize::new(20).expect("non-zero"),
+)
+
+// Vector search with filter: find episodic engrams similar to query
+g().vector_search_with(
+    "Engram",
+    "embedding",
+    query_embedding,
+    NonZeroUsize::new(20).expect("non-zero"),
+).filter(PropertyFilter::property("engram_type").eq("episodic"))
 ```

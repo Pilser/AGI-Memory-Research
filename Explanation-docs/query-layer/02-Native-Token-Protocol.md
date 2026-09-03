@@ -93,14 +93,61 @@ Model outputs: <|memory_recall|> description of what to remember
 
 Runtime action:
   1. Extracts the description text
-  2. Calls SearchEngramsFull(query=description, limit=10)
-  3. Runs CRR resonance formula on candidates
-  4. Formats top results as natural memory snippets
-  5. INJECTS result into the stream at the token position
-  6. Model continues generating as if it naturally remembered
+  2. Computes query embedding client-side
+  3. Calls search_engrams_full() — vector search on Engram.embedding directly
+  4. Runs CRR resonance formula on candidates
+  5. Formats top results as natural memory snippets
+  6. INJECTS result into the stream at the token position
+  7. Model continues generating as if it naturally remembered
 
 Total latency: 2-5ms (imperceptible to the model)
 ```
+
+### CTP Injection: Simplified Query Pattern
+
+The runtime uses the Rust DSL with direct-on-node vector storage:
+
+```rust
+// Step 1: Compute embedding from the description text
+let query_embedding: Vec<f32> = embed(description);
+
+// Step 2: Vector search on Engram directly (no ::In<HasVector> traversal)
+let search_request = search_engrams_full(
+    query_embedding,
+    10,                      // limit
+    0.15,                    // min_importance
+);
+let search_response = client.query(search_request).send().await?;
+let candidates: Vec<EngramData> = serde_json::from_value(
+    search_response["candidates"].clone()
+)?;
+
+// Step 3: Fetch identity for resonance scoring
+let identity_request = get_all_identity();
+let identity_response = client.query(identity_request).send().await?;
+let identities: Vec<IdentityData> = serde_json::from_value(
+    identity_response["traits"].clone()
+)?;
+
+// Step 4: Score and rank
+let mut scored: Vec<ScoredEngram> = candidates.iter().map(|engram| {
+    let resonance = compute_resonance(
+        1.0 - engram.$distance,      // semantic similarity from vector search
+        compute_recency(&engram.timestamp),
+        engram.emotional_charge.abs(),
+        compute_alignment(engram, &identities),
+        if engram.contradiction_flag { 0.5 } else { 1.0 },
+    );
+    ScoredEngram { engram, resonance }
+}).collect();
+scored.sort_by(|a, b| b.resonance.partial_cmp(&a.resonance).unwrap());
+
+// Step 5: Format and inject into token stream
+let formatted = format_memories(&scored);
+inject_into_stream_at_token_position(formatted);
+```
+
+**Key simplification:** The vector search query uses `g().vector_search_with("Engram", "embedding", query_embedding, limit, None)` which returns `Engram` nodes directly. No `::In<HasVector>` traversal — the embedding is a property of the `Engram` node itself.
 
 ### Example — What the Model Experiences
 
@@ -170,14 +217,57 @@ Runtime action:
   1. Extracts the content text
   2. Runs EmotionalTagger → emotional_charge
   3. Runs ImportanceScorer → importance_score
-  4. Calls CreateFullEngram(episode_raw=content, ...)
-  5. Extracts concepts, creates edges
-  6. Checks contradictions against existing engrams
-  7. Does NOT inject anything — the model continues uninterrupted
-  8. Memory is stored. The model may never know this happened.
+  4. Computes embedding client-side
+  5. Calls create_full_engram() — ONE step, embedding on Engram node directly
+  6. Extracts concepts, creates edges
+  7. Checks contradictions against existing engrams
+  8. Does NOT inject anything — the model continues uninterrupted
+  9. Memory is stored. The model may never know this happened.
 
 Total latency: 3-5ms (async, non-blocking to generation)
 ```
+
+### CTP Injection: Simplified Store Pattern
+
+```rust
+// Step 1: Score and tag
+let emotional_charge = emotional_tagger.tag(&content);
+let importance_score = importance_scorer.score(&content);
+let embedding: Vec<f32> = embed(&content);
+
+// Step 2: CreateFullEngram — single step with embedding on the node
+// No EngramVector node, no HasVector edge — just one add_n() call
+let create_request = create_full_engram(
+    content.clone(),          // episode_raw
+    emotional_charge,
+    importance_score,
+    0.05,                     // decay_rate
+    "episodic".to_string(),   // engram_type
+    0,                        // compression_level
+    false,                    // contradiction_flag
+    embedding,                // stored directly on Engram.embedding
+);
+let create_response = client.query(create_request).send().await?;
+let engram_id: u64 = serde_json::from_value(
+    create_response["engram"]["$id"].clone()
+)?;
+
+// Step 3: Extract and link concepts
+let concepts = concept_extractor.extract(&content);
+for concept in concepts {
+    let concept_id = match find_or_create_concept(&concept).await? {
+        Some(id) => id,
+        None => create_concept(concept.name, concept.confidence).await?,
+    };
+    connect_recalls(engram_id, concept_id).await?;
+    connect_abstraction(engram_id, concept_id).await?;
+}
+
+// Step 4: Check contradictions (non-blocking)
+contradiction_detector.check_new_engram(engram_id).await?;
+```
+
+**Key simplification:** `create_full_engram()` creates the `Engram` node with the `embedding` property in a single `add_n("Engram", ...)` call. The old design required three steps: create engram → create `EngramVector` node → connect with `HasVector` edge. Now it's one atomic write.
 
 ### Example
 
@@ -193,6 +283,7 @@ Model outputs:
 
 Runtime:
   → Stores engram with importance=0.78, emotional=+0.5 (discovery/relief)
+     Embedding stored directly on the Engram node (no separate vector node)
   → Links to concepts: "PostgreSQL WAL", "replication configuration",
     "database performance tuning"
   → Checks contradictions: none found
@@ -239,6 +330,44 @@ Runtime action:
 
 Total latency: 50-500ms depending on graph size (acceptable at session boundaries)
 ```
+
+### CTP Injection: Simplified Consolidation Pattern
+
+```rust
+// Step 1: Baseline metrics
+let baseline = get_memory_stats().await?;
+
+// Step 2: Decay pass — single query, no vector traversal needed
+let engrams = get_engrams_for_decay_check("episodic".to_string()).await?;
+
+for engram in engrams {
+    let retention = compute_retention(&engram);
+    if retention < 0.05 && engram.importance_score < 0.1 {
+        // prune_engram: single drop, no vector cascade
+        // (embedding is on the Engram node — drop removes everything)
+        prune_engram(engram.$id).await?;
+    } else if retention < 0.15 && engram.importance_score < 0.3 {
+        compress_engram(engram.$id).await?;
+    } else if retention > 0.8 && engram.activation_count > 20 {
+        promote_to_semantic(engram.$id).await?;
+    }
+}
+
+// Step 3: If aggressive — mitosis, contradiction, identity passes
+if aggressive {
+    let overloaded = check_mitosis_candidates(10).await?;
+    for concept in overloaded {
+        cluster_and_split(concept).await?;
+    }
+    let contradicted = get_contradicted_engrams().await?;
+    for engram in contradicted {
+        resolve_contradictions(engram).await?;
+    }
+    crystallize_identity_traits().await?;
+}
+```
+
+**Key simplification:** `prune_engram()` is a single `g().n(NodeRef::id(id)).drop()` — no vector cascade. Since the embedding lives directly on the `Engram` node, dropping the node removes everything. No need to also delete a separate `EngramVector` node and its `HasVector` edge.
 
 ### When the Model Should Emit This
 

@@ -165,69 +165,115 @@ The consolidation loop can **resolve** contradictions by:
 
 ---
 
-## Possible Model Types
+## Recommended Approach: Hybrid Pipeline
 
-### Option A: LLM with structured output (OpenAI, Anthropic)
+> **This is the recommended approach.** Combines the speed of embedding filtering with the accuracy of LLM. The embedding filter narrows thousands of candidates to ~5-10 high-confidence pairs, then LLM makes the final decision.
+
+### How It Works
 
 ```
-Prompt: "Compare these two statements. Do they contradict each other
-         about the same specific topic, or are they about different
-         aspects? Return JSON:
+Step 1: EMBEDDING FILTER (fast, free, local)
+  For each concept:
+    Get all engrams recalling this concept
+    Filter: opposite emotional signs AND cosine_similarity > 0.70
+    Result: ~5-10 candidate pairs (down from thousands)
 
-         {
-           "contradicts": true/false,
-           "semantic_similarity": 0.0-1.0,
-           "explanation": "why or why not"
-         }
-
-         Statement A: {engram_a.episode_raw}
-         Statement B: {engram_b.episode_raw}"
+Step 2: LLM VERIFICATION (accurate, few API calls)
+  For each candidate pair:
+    Ask LLM: "Do these contradict each other about the same topic?"
+    Result: Confirmed contradiction or false positive
 ```
 
-- **Pros:** Best accuracy, understands nuance and domain context
-- **Cons:** Slow if checking many pairs (47 engrams × 12 candidates = 564 comparisons)
-
-### Option B: Embedding comparison (fast, local)
-
-- Embed both engram texts (reuse existing `EngramVector` from DB)
-- Compute cosine similarity
-- If similarity > threshold (e.g., 0.75) AND opposite emotional signs → contradiction
+### Implementation
 
 ```rust
-fn detect_contradiction(a: &Engram, b: &Engram) -> bool {
-    let sim = cosine_similarity(&a.embedding, &b.embedding);
-    let opposite_signs = a.emotional_charge.sign() != b.emotional_charge.sign();
-    let emotional_gap = (a.emotional_charge - b.emotional_charge).abs();
+/// Detect contradictions using hybrid pipeline
+pub async fn detect_contradictions(
+    &self,
+    concept_id: u64,
+) -> Result<Vec<(u64, u64)>, Box<dyn std::error::Error>> {
+    // Step 1: Embedding filter (fast, free)
+    let candidates_request = get_engrams_recalling_concept_with_embeddings(concept_id);
+    let candidates_response = self.client.query(candidates_request).send().await?;
+    let engrams: Vec<EngramCandidateWithEmbedding> = serde_json::from_value(
+        candidates_response["engrams"].clone()
+    )?;
 
-    sim > 0.70 && opposite_signs && emotional_gap > 0.6
+    // Filter: opposite emotional signs + high semantic similarity
+    let mut candidate_pairs: Vec<(u64, u64, f64)> = vec![];
+    for i in 0..engrams.len() {
+        for j in (i + 1)..engrams.len() {
+            let a = &engrams[i];
+            let b = &engrams[j];
+            let opposite_signs = a.emotional_charge.signum() != b.emotional_charge.signum();
+            let emotional_gap = (a.emotional_charge - b.emotional_charge).abs();
+            let sim = cosine_similarity(&a.embedding, &b.embedding);
+
+            if opposite_signs && emotional_gap > 0.6 && sim > 0.70 {
+                candidate_pairs.push((a.id, b.id, sim));
+            }
+        }
+    }
+
+    // Step 2: LLM verification (accurate, few calls)
+    let mut confirmed_contradictions: Vec<(u64, u64)> = vec![];
+    for (id_a, id_b, _) in candidate_pairs {
+        let is_contradiction = self.llm_verify_contradiction(id_a, id_b).await?;
+        if is_contradiction {
+            confirmed_contradictions.push((id_a, id_b));
+        }
+    }
+
+    Ok(confirmed_contradictions)
+}
+
+/// LLM verification for a candidate pair
+async fn llm_verify_contradiction(
+    &self,
+    engram_a_id: u64,
+    engram_b_id: u64,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let prompt = format!(
+        "Compare these two statements. Do they contradict each other \
+         about the same specific topic, or are they about different aspects? \
+         Return JSON: {{\"contradicts\": true/false, \"explanation\": \"why or why not\"}}\n\n\
+         Statement A: {}\n\
+         Statement B: {}",
+        get_engram_text(engram_a_id).await?,
+        get_engram_text(engram_b_id).await?,
+    );
+
+    // Call LLM and parse response
+    // ...
 }
 ```
 
-- **Pros:** Very fast, no additional API calls, embeddings already stored
-- **Cons:** Embedding similarity ≠ contradiction detection; two texts can be semantically similar but not contradictory (e.g., two positive statements about the same thing)
+### When to Use Each Component
 
-### Option C: Cross-encoder / NLI model (ONNX / Candle)
+| Scenario | Approach | Why |
+|----------|----------|-----|
+| **At ingestion** (5-30 pairs) | LLM directly | Few pairs, accuracy matters most |
+| **During consolidation** (thousands) | Embedding filter → LLM on top hits | Speed for bulk, accuracy for decision |
 
-- Use a Natural Language Inference model (e.g., RoBERTa fine-tuned on MNLI)
-- Input: premise (engram A text) + hypothesis (engram B text)
-- Output: entailment / neutral / contradiction
+### Performance
 
-- **Pros:** Specifically designed for contradiction detection, high accuracy
-- **Cons:** One forward pass per pair, needs ONNX export and `ort` runtime in Rust
+| Scenario | Pairs After Filter | LLM Calls | Time |
+|----------|-------------------|-----------|------|
+| 1 new engram, 1 concept, 5 existing | ~2-3 | 2-3 | ~1s |
+| 1 new engram, 5 concepts, 100 existing | ~10-15 | 10-15 | ~5s |
+| Consolidation: 500 concepts, avg 10 each | ~50-100 | 50-100 | ~30s |
+| Consolidation: 10,000 concepts | ~500-1000 | 500-1000 | ~5min |
 
-### Option D: Hybrid pipeline
-
-1. **Embedding filter** (fast, Option B) → narrow down to candidates with cosine similarity > 0.7 AND opposite emotional signs
-2. **LLM or NLI model** (accurate, Option A or C) → only on the filtered pairs
-3. This reduces cost: from N×M comparisons to ~5-10 LLM calls per new engram
+The embedding filter reduces LLM calls by ~99% while maintaining accuracy.
 
 ---
 
-## Performance Considerations
+## Implementation
 
-| Scenario | Pairs to Check | Strategy |
-|---|---|---|
-| 1 new engram, 1 concept, 5 existing engrams | 5 | All pairs via LLM — cheap |
-| 1 new engram, 5 concepts, 100 total existing engrams | ~30 (after emotional sign filter) | Embedding filter → LLM top hits |
-| Consolidation: 500 concepts, avg 10 engrams each | ~2500 concept groups | Batch embedding comparison, LLM only on high-confidence hits |
-| Consolidation: 10,000 concepts | ~50,000 concept groups | Scheduled: process oldest concepts first, rotate daily |
+For the actual Rust DSL implementation of queries mentioned in this doc, see:
+- [Query Reference](../helixdb-embedded-queries.md)
+- [Full Pipeline](../helixdb-embedded-pipeline.rs)
+- [Schema Definition](../helixdb-embedded-schema.md)
+
+For the resonance scoring that uses contradiction flags, see:
+- [06-Resonance-Scorer.md](./06-Resonance-Scorer.md)

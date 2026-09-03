@@ -317,166 +317,210 @@ impl MemoryPipeline {
 
 ---
 
-## Can the 9 Parameters Become Smarter?
+## Recommended Approach: Adam + 9 Parameters
 
-The question "can the parameters themselves be updated to become smarter" has two legitimate interpretations:
+> **This is the recommended implementation.** Start here and only upgrade if you hit limitations.
 
-### Interpretation A: Better Optimization (the straightforward answer)
+### Why Adam (not SGD)?
 
-Replace vanilla SGD with Adam — an adaptive optimizer that adjusts learning rates per-parameter:
+| Feature | SGD | Adam (Recommended) |
+|---------|-----|-------------------|
+| Convergence | Slower | **Faster** — adaptive learning rates |
+| Noise handling | Can oscillate | **Momentum smooths noise** |
+| Per-parameter tuning | Manual | **Automatic** — each α gets its own step size |
+| Memory cost | 0 extra | **18 extra floats** (m and v for 9 params) |
+| Compute cost | 9 multiply-adds | **~20 multiply-adds** — still trivial |
 
-```
-Instead of:
-    α ← α + η × gradient
+Adam on 9 parameters is computationally free but converges significantly faster than SGD. The extra 18 floats of state (momentum + velocity) are worth it.
 
-Use Adam:
-    m_t = β₁ × m_{t-1} + (1 − β₁) × gradient     ← momentum
-    v_t = β₂ × v_{t-1} + (1 − β₂) × gradient²     ← velocity
-    α ← α + η × m_t / (√v_t + ε)                  ← adaptive step
+### Implementation
 
-Default: β₁ = 0.9, β₂ = 0.999, ε = 1e-8, η = 0.01
-```
+```rust
+/// Learnable edge weights with Adam optimizer state
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeWeights {
+    // The 9 α weights (α₁-α₈ + β recurrent)
+    pub recalls: f64,        // α₁: engram→concept association
+    pub abstracts_to: f64,   // α₂: engram→concept abstraction
+    pub reinforces: f64,     // α₃: engram↔engram mutual support
+    pub temporal_seq: f64,   // α₄: engram→engram time chain
+    pub contradicts: f64,    // α₅: engram↔engram suppression (negative)
+    pub defines: f64,        // α₆: concept→identity (slow path)
+    pub spawned_from: f64,   // α₇: parent→child hierarchy
+    pub recurrent: f64,      // β: re-injection weight per feedback iteration
 
-**What this buys you:**
-- Parameters that update frequently get smaller steps (don't overreact)
-- Parameters that rarely update get larger steps (catch up faster)
-- Momentum smooths out noise from individual sessions
-
-Adam on 9 parameters is computationally free. It's literally:
-
-```python
-# Adam state: 18 floats (m and v for each of 9 params)
-m = [0.0] * 9
-v = [0.0] * 9
-beta1 = 0.9
-beta2 = 0.999
-eps = 1e-8
-t = 0
-
-def adam_update(alphas, gradients):
-    for i in range(9):
-        t += 1
-        m[i] = beta1 * m[i] + (1 - beta1) * gradients[i]
-        v[i] = beta2 * v[i] + (1 - beta2) * gradients[i]**2
-        m_hat = m[i] / (1 - beta1**t)
-        v_hat = v[i] / (1 - beta2**t)
-        alphas[i] += 0.01 * m_hat / (sqrt(v_hat) + eps)
-```
-
-### Interpretation B: Context-Dependent Weights (the interesting answer)
-
-The current design uses **global α weights** — same for all queries. But what if the optimal α profile depends on **what kind of query is being asked**?
-
-A factual query ("What database did we choose?") should weight `Recalls` and `HasVector` higher — direct associations matter most.
-
-A reasoning query ("Should we migrate?") should weight `AbstractsTo`, `TemporalSequence`, and `β` higher — the system needs abstracted knowledge, temporal context, and deep associative chains.
-
-A contradiction query ("Does this conflict with our decision?") should weight `Contradicts` higher — suppressing conflicted memories matters more than surfacing new ones.
-
-**The solution: a context vector that modulates α weights per query.**
-
-```python
-# Instead of: global α = [α₁, α₂, ..., α₈]
-# Use:        α(query) = α_base + W × context_vector(query)
-
-context_vector(query):
-    # A 4-dimensional vector computed at stimulation time:
-    [
-        query_emotional_tone,        # -1.0 to 1.0 (from quick sentiment model)
-        query_abstractness,          # 0.0 (concrete fact) to 1.0 (abstract reasoning)
-        query_contradiction_risk,    # 0.0 to 1.0 (how likely this conflicts)
-        query_temporal_scope,        # 0.0 (now) to 1.0 (historical)
-    ]
-
-W: 9×4 matrix (36 parameters total)
-α_base: 9 parameters (default weights)
-```
-
-Now the system learns **36 parameters** (W matrix) instead of 9. Still tiny. Still SGD-learnable in realtime. Still runs on edge.
-
-```python
-def compute_context_weights(alphas_base, W, query):
-    ctx = context_vector(query)  # [f32; 4]
-
-    # Modulate base weights by context
-    alphas_contextualized = alphas_base.copy()
-    for i in range(9):
-        modulation = dot_product(W[i], ctx)  # scalar
-        alphas_contextualized[i] += modulation
-        alphas_contextualized[i] = clamp(alphas_contextualized[i], bounds[i])
-
-    return alphas_contextualized
-```
-
-**What this enables:**
-
-| Query Type | ctx_vector | Learned effect |
-|---|---|---|
-| "What DB did we pick?" | [0.1, 0.05, 0.0, 0.1] | α₁↑, α₂↑ — direct recall, no chaining needed |
-| "Should we migrate off Postgres?" | [−0.2, 0.7, 0.5, 0.3] | α₃↑, α₅↑, α₆↓(stronger negative) — abstract, temporal, contradiction-aware |
-| "Tell me everything about our DB history" | [0.3, 0.4, 0.0, 0.8] | β↑↑, α₂↑ — deep recurrent chaining, concept associations |
-| "I think managed cloud is better now" | [0.1, 0.2, 0.9, 0.6] | α₆↓↓↓ — strongly activate contradiction pathway |
-
-### Interpretation C: Multi-Armed Bandit Over Optimizers (meta-learning)
-
-The system can maintain multiple optimization strategies and dynamically select the best one:
-
-```python
-optimizers = {
-    "SGD":        lambda g: g * 0.01,
-    "Adam":       lambda g: adam_step(g),
-    "RMSprop":    lambda g: rmsprop_step(g),
-    "conservative": lambda g: g * 0.001,  # tiny steps — use when unsure
-    "aggressive":   lambda g: g * 0.05,   # big steps — use when feedback is clear
+    // Adam optimizer state (2 × 9 = 18 floats)
+    pub m: [f64; 8],  // momentum
+    pub v: [f64; 8],  // velocity
+    pub t: u64,       // timestep
 }
 
-# Track performance of each optimizer
-optimizer_rewards = {name: [] for name in optimizers}
+impl EdgeWeights {
+    /// Default weights (before any learning)
+    pub fn defaults() -> Self {
+        Self {
+            recalls: 0.70,
+            abstracts_to: 0.50,
+            reinforces: 0.60,
+            temporal_seq: 0.30,
+            contradicts: -0.40,
+            defines: 0.20,
+            spawned_from: 0.45,
+            recurrent: 0.35,
+            m: [0.0; 8],
+            v: [0.0; 8],
+            t: 0,
+        }
+    }
 
-def select_optimizer():
-    # UCB (Upper Confidence Bound) bandit selection
-    for name in optimizers:
-        if len(optimizer_rewards[name]) == 0:
-            return name  # Try untested optimizers first
+    /// Adam update step
+    pub fn adam_update(&mut self, attributions: &[f64; 8], recurrent_attr: f64, reward: f64) {
+        if reward == 0.0 {
+            return; // No signal, no update
+        }
 
-    scores = {}
-    for name in optimizers:
-        mean_reward = mean(optimizer_rewards[name])
-        uncertainty = sqrt(2 * log(total_updates) / len(optimizer_rewards[name]))
-        scores[name] = mean_reward + uncertainty
+        self.t += 1;
+        let lr = 0.01;
+        let beta1 = 0.9;
+        let beta2 = 0.999;
+        let eps = 1e-8;
 
-    return max(scores, key=scores.get)
+        let weights = [
+            &mut self.recalls, &mut self.abstracts_to, &mut self.reinforces,
+            &mut self.temporal_seq, &mut self.contradicts, &mut self.defines,
+            &mut self.spawned_from, &mut self.recurrent,
+        ];
+
+        for i in 0..8 {
+            if attributions[i] < 0.001 {
+                continue; // This edge type wasn't involved
+            }
+
+            // Gradient
+            let gradient = attributions[i] * reward;
+
+            // Adam momentum and velocity
+            self.m[i] = beta1 * self.m[i] + (1.0 - beta1) * gradient;
+            self.v[i] = beta2 * self.v[i] + (1.0 - beta2) * gradient * gradient;
+
+            // Bias-corrected estimates
+            let m_hat = self.m[i] / (1.0 - beta1.powi(self.t as i32));
+            let v_hat = self.v[i] / (1.0 - beta2.powi(self.t as i32));
+
+            // Update
+            *weights[i] += lr * m_hat / (v_hat.sqrt() + eps);
+
+            // Clamp to valid range
+            if i == 4 {  // Contradicts — must stay negative
+                *weights[i] = weights[i].clamp(-0.95, -0.05);
+            } else {     // All other edges — must stay positive
+                *weights[i] = weights[i].clamp(0.01, 0.98);
+            }
+        }
+
+        // Update recurrent weight β
+        if recurrent_attr.abs() > 0.001 {
+            let gradient = recurrent_attr * reward;
+            // ... same Adam update for β ...
+            self.recurrent = self.recurrent.clamp(0.05, 0.75);
+        }
+    }
+}
 ```
 
-The system discovers: "When the reward signal is noisy (user gave ambiguous feedback), conservative steps work better. When the signal is clear (user explicitly corrected me), aggressive steps are safe." This is automatic — the bandit learns it from data.
+### Memory Profile
 
-### Interpretation D: Distribution Shift Detection (knowing when to re-learn)
-
-A user's preferences drift over time. What worked 100 sessions ago may not work now. The system needs to detect this:
-
-```python
-def detect_shift(recent_rewards, window=20, threshold=0.3):
-    """
-    Compare recent rewards to historical average.
-    If recent is significantly worse, the world changed.
-    """
-    historical_mean = mean(all_rewards[:-window])
-    recent_mean = mean(recent_rewards[-window:])
-
-    drift = historical_mean - recent_mean
-
-    if drift > threshold:
-        # Boost learning rate — we need to re-adapt
-        return True, min(0.05, base_lr * (1 + drift * 2))
-    else:
-        return False, base_lr
-```
-
-When drift is detected, the learning rate increases temporarily, and the system re-adapts to the new pattern. This prevents the weights from becoming stale without manual intervention.
+| Resource | Cost |
+|---|---|
+| 9 α weights | 72 bytes |
+| Adam state (m + v) | 144 bytes |
+| Reward history (100 entries) | 400 bytes |
+| **Total** | **~616 bytes** |
+| Training per session | ~20 microseconds |
+| Disk I/O | Write ~616 bytes to JSON |
 
 ---
 
-## The Full Learning Architecture
+## Optional Enhancement: Context-Dependent Weights (45 params)
+
+> **Only implement this if you find the same weights don't work for different query types.**
+> See [07-Stimulation-Layer.md](./07-Stimulation-Layer.md) for the full context on when this is needed.
+
+### When to Upgrade
+
+| Symptom | Solution |
+|---------|----------|
+| Factual queries ("What did we choose?") surface too many abstract memories | Context-dependent weights can weight `Recalls` higher for factual queries |
+| Reasoning queries ("Should we migrate?") surface too few associations | Context-dependent weights can weight `AbstractsTo` and `β` higher for reasoning |
+| Contradiction queries don't suppress enough | Context-dependent weights can weight `Contradicts` higher for contradiction queries |
+
+### How It Works
+
+Instead of global α weights, compute weights per query:
+
+```rust
+/// Context vector: 4 dimensions computed at stimulation time
+pub struct ContextVector {
+    pub emotional_tone: f64,      // -1.0 to 1.0
+    pub abstractness: f64,        // 0.0 (concrete) to 1.0 (abstract)
+    pub contradiction_risk: f64,  // 0.0 to 1.0
+    pub temporal_scope: f64,      // 0.0 (now) to 1.0 (historical)
+}
+
+/// 9×4 matrix: how each context dimension modulates each α weight
+pub struct ContextMatrix {
+    pub w: [[f64; 4]; 9],  // 36 parameters
+}
+
+pub fn compute_context_weights(
+    alpha_base: &EdgeWeights,
+    context_matrix: &ContextMatrix,
+    context: &ContextVector,
+) -> [f64; 9] {
+    let ctx = [
+        context.emotional_tone,
+        context.abstractness,
+        context.contradiction_risk,
+        context.temporal_scope,
+    ];
+
+    let mut result = [0.0; 9];
+    let base = [
+        alpha_base.recalls, alpha_base.abstracts_to, alpha_base.reinforces,
+        alpha_base.temporal_seq, alpha_base.contradicts, alpha_base.defines,
+        alpha_base.spawned_from, alpha_base.recurrent,
+    ];
+
+    for i in 0..9 {
+        let modulation: f64 = context_matrix.w[i].iter().zip(ctx.iter()).map(|(w, c)| w * c).sum();
+        result[i] = (base[i] + modulation).clamp(0.01, 0.98);
+    }
+
+    result
+}
+```
+
+### What This Enables
+
+| Query Type | ctx_vector | Learned effect |
+|---|---|---|
+| "What DB did we pick?" | [0.1, 0.05, 0.0, 0.1] | α₁↑, α₂↑ — direct recall, no chaining |
+| "Should we migrate off Postgres?" | [−0.2, 0.7, 0.5, 0.3] | α₃↑, α₅↑, α₆↓(stronger negative) — abstract, temporal, contradiction-aware |
+| "Tell me everything about our DB history" | [0.3, 0.4, 0.0, 0.8] | β↑↑, α₂↑ — deep recurrent chaining |
+| "I think managed cloud is better now" | [0.1, 0.2, 0.9, 0.6] | α₆↓↓↓ — strongly activate contradiction pathway |
+
+### Memory Profile (Context-Dependent)
+
+| Resource | Cost |
+|---|---|
+| 9 α base weights | 72 bytes |
+| 36 context matrix params | 288 bytes |
+| Adam state (9 params) | 144 bytes |
+| **Total** | **~504 bytes** (plus base) |
+
+---
+
+## Full Learning Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -494,68 +538,33 @@ When drift is detected, the learning rate increases temporarily, and the system 
 │                          ┌──────▼───────────────────▼───┐     │
 │                          │       Parameter Store         │     │
 │                          │                                │     │
-│                          │  α_base[9]  +  W[9×4]        │     │
-│                          │  (defaults)   (context mod)   │     │
-│                          │                                │     │
+│                          │  α_base[9]                    │     │
 │                          │  Adam state: m[9], v[9]       │     │
 │                          │  Reward history: last 100     │     │
-│                          │  Shift detector               │     │
-│                          │  LR scheduler                 │     │
 │                          └──────────────┬────────────────┘     │
 │                                          │                      │
 │  ┌───────────────────────────────────────▼───────────────────┐ │
 │  │                 Stimulation Engine                        │ │
 │  │                                                           │ │
-│  │  1. Receive query → compute context_vector                │ │
-│  │  2. α(query) = α_base + W × ctx      ← contextual weights │ │
-│  │  3. Run spreading activation with α(query), β             │ │
-│  │  4. Return surfaced engrams + activation trace             │ │
+│  │  1. Receive query                                        │ │
+│  │  2. Run spreading activation with α weights, β           │ │
+│  │  3. Return surfaced engrams + activation trace            │ │
 │  └───────────────────────────────────────────────────────────┘ │
 │                                                                │
-│  Total learnable parameters: 45 (9 base + 36 context matrix)   │
-│  Total optimizer state: 18 floats (Adam m + v for 9 params)    │
-│  Total memory: < 1KB                                           │
-│  Training per session: ~20 microseconds (45 multiply-adds)      │
+│  Total learnable parameters: 9                                  │
+│  Total optimizer state: 18 floats (Adam m + v)                  │
+│  Total memory: ~616 bytes                                       │
+│  Training per session: ~20 microseconds                         │
 └──────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## On-Device Learning Profile
-
-| Resource | Cost |
-|---|---|
-| Parameters to store | 45 × f32 = 180 bytes |
-| Optimizer state (Adam) | 18 × f32 = 72 bytes |
-| Reward history ring buffer | 100 × f32 = 400 bytes |
-| Total memory | < 1KB |
-| Attribution computation | O(surfaced_engrams × avg_edges_per_path) ≈ 50-200 operations |
-| Gradient computation | 9 multiply-adds (basic) or 45 (context-aware) |
-| Disk I/O (save weights) | Write 180 bytes to JSON file after each session |
-| Does it need a GPU? | No |
-| Does it need offline batch training? | No |
-| Does it share data with a server? | No |
-
----
-
-## Learner Sophistication Tiers
-
-| Tier | Parameters | Optimizer | Context-Aware | Shift Detection | When to Use |
-|---|---|---|---|---|---|
-| **Tier 0** | 9 (global α) | SGD | No | No | Phase 1 — get learning working |
-| **Tier 1** | 9 (global α) | Adam | No | No | Phase 1.1 — better convergence |
-| **Tier 2** | 45 (α + W matrix) | Adam | Yes (4-dim context) | No | Phase 2 — contextual retrieval |
-| **Tier 3** | 45 + bandit state | Adam with UCB optimizer selection | Yes | Yes | Phase 3 — fully adaptive |
-
-All four tiers run on edge, in realtime, from user feedback alone. Tier 3 adds maybe 100 bytes of bandit state and a few hundred extra operations per session. The complexity jump from Tier 0 to Tier 3 is negligible in compute but significant in behavioral quality.
-
----
-
 ## Why This Works
 
-The problem has friendly properties that make realtime SGD viable:
+The problem has friendly properties that make realtime learning viable:
 
-1. **Low dimension** — 9-45 parameters means fast convergence, no overfitting, no gradient noise
+1. **Low dimension** — 9 parameters means fast convergence, no overfitting, no gradient noise
 2. **Direct attribution** — we know exactly which edges contributed to each surfacing (the trace records it), so the gradient is zero-noise
 3. **Bounded reward** — reward is always in [−1, +1], no gradient explosion
 4. **Sparse updates** — only active edges get updated; inactive ones stay put (implicit regularization)
@@ -563,3 +572,31 @@ The problem has friendly properties that make realtime SGD viable:
 6. **Personalized** — each AI agent learns retrieval dynamics specific to its user, its role, its domain. No two agents converge to the same weights
 
 The system doesn't need to be "trained" in the ML sense. It learns continuously, from every interaction, getting slightly better at remembering what matters to you with every conversation.
+
+---
+
+## Why This Works
+
+The problem has friendly properties that make realtime learning viable:
+
+1. **Low dimension** — 9 parameters means fast convergence, no overfitting, no gradient noise
+2. **Direct attribution** — we know exactly which edges contributed to each surfacing (the trace records it), so the gradient is zero-noise
+3. **Bounded reward** — reward is always in [−1, +1], no gradient explosion
+4. **Sparse updates** — only active edges get updated; inactive ones stay put (implicit regularization)
+5. **Natural curriculum** — the user's conversations naturally progress from simple to complex topics as the relationship deepens; the learning problem gets harder gradually and naturally
+6. **Personalized** — each AI agent learns retrieval dynamics specific to its user, its role, its domain. No two agents converge to the same weights
+
+The system doesn't need to be "trained" in the ML sense. It learns continuously, from every interaction, getting slightly better at remembering what matters to you with every conversation.
+
+---
+
+## Implementation
+
+For the actual Rust DSL implementation of queries mentioned in this doc, see:
+- [Query Reference](../helixdb-embedded-queries.md)
+- [Full Pipeline](../helixdb-embedded-pipeline.rs)
+- [Retrieval Layer](../helixdb-embedded-retrieval.md)
+- [Schema Definition](../helixdb-embedded-schema.md)
+
+For context-dependent weights (the optional enhancement), see:
+- [07-Stimulation-Layer.md](./07-Stimulation-Layer.md)

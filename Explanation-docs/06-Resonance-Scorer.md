@@ -31,13 +31,15 @@ resonance(query, engram) =
 #### Factor 1: Semantic Similarity
 
 ```
-semantic_similarity = cosine(Embed(query), engram_vector)
+semantic_similarity = cosine(query_embedding, engram.embedding)
 ```
 
-- **Source:** HelixDB `SearchV` returns cosine similarity scores
+- **Source:** HelixDB `vector_search_with("Engram", "embedding", ...)` returns `$distance` (converted to similarity: `1.0 - distance`)
 - **Range:** 0.0 (completely unrelated) to 1.0 (identical)
 - **Role:** The baseline — "is this memory about the topic I'm asking about?"
-- **ML involvement:** The embedding model (OpenAI/Gemini) generates the vectors; HelixDB does the cosine comparison server-side
+- **ML involvement:** Embedding model (client-side) generates query vector; HelixDB does the cosine comparison via vector index on `Engram.embedding`
+
+**Key simplification:** Embeddings are stored directly on Engram nodes. Vector search returns Engram nodes directly — no `::In<HasVector>` traversal needed.
 
 #### Factor 2: Recency Weight
 
@@ -157,11 +159,11 @@ This is critical: every time an engram is recalled, its `activation_count` incre
 ```
 User query: "What do I know about East African tech?"
 
-Step 1: HelixDB SearchV
+Step 1: HelixDB Vector Search
   Embed("What do I know about East African tech?") → query_vector[1536]
-  SearchV<EngramVector>(query_vector, limit=20) → top-20 candidate vectors
-  ::In<HasVector> → traverse back to 20 engram nodes
-  ::WHERE(importance >= 0.0, contradiction_flag != true) → apply filters
+  vector_search_with("Engram", "embedding", query_vector, limit=20) → top-20 Engram nodes DIRECTLY
+  (No ::In<HasVector> traversal needed — embedding is on the Engram node)
+  Filter: importance >= 0.0, contradiction_flag != true
   Returns: 18 candidates (2 filtered out by contradiction)
 
 Step 2: Fetch Identity Graph
@@ -227,48 +229,77 @@ Step 6: Inject into LLM context
 
 ---
 
-## Possible Model Types
+## Recommended Approach: Multiplicative Formula
 
-### The Resonance Scorer is NOT a trained model
+> **This is the recommended approach.** The Resonance Scorer is pure math — a deterministic Rust function with no weights to learn. Personalization comes from the **Stimulation Layer's learnable edge weights** (see [07-Stimulation-Layer.md](./07-Stimulation-Layer.md)), not from making the scorer itself learn.
 
-It's pure math — a Rust function with no weights to learn. The "intelligence" comes from the four other ML models whose outputs it combines:
+### Why Not a Learned Scorer?
 
-| Factor | Powered By | Trained? |
-|---|---|---|
-| Semantic similarity | Embedding model (OpenAI/Gemini) | Pre-trained |
-| Recency weight | Math (exponential decay) | Not ML |
-| Emotional amplification | Emotional Tagger output | Custom ML (see doc 01) |
-| Identity alignment | Graph traversal + embedding comparison | Uses Identity graph (built over time) |
-| Contradiction penalty | Contradiction Detector output | Custom ML or rule-based (see doc 04) |
+| Approach | Complexity | Personalization | Recommendation |
+|----------|------------|-----------------|----------------|
+| **Multiplicative formula** | Simple, deterministic | Comes from Stimulation Layer | **Recommended** |
+| **Learned scorer (XGBoost/NN)** | More complex | Redundant with Stimulation Layer | Not needed |
 
-### However — you can make it learn
+The Stimulation Layer already has 9 learnable α weights that personalize how activation YOUR retrieval patterns. Adding a learned resonance scorer on top would be redundant — two systems trying to personalize the same thing.
 
-A **learned resonance scorer** would replace the multiplicative formula with a model that learns weights from user feedback:
+### Implementation
 
+```rust
+/// Compute resonance score using the 5-factor multiplicative formula
+/// This is pure math — no learned weights
+pub fn compute_resonance(
+    semantic_sim: f64,        // Factor 1: from vector search (1.0 - distance)
+    days_elapsed: f64,        // Factor 2: from engram.timestamp
+    emotional_charge: f64,    // Factor 3: from Emotional Tagger
+    identity_alignment: f64,  // Factor 4: from graph traversal
+    contradiction_flag: bool,  // Factor 5: from Contradiction Detector
+    decay_rate: f64,          // per-engram parameter (default: 0.05)
+) -> f64 {
+    // Factor 1: semantic similarity (baseline)
+    let semantic = semantic_sim;
+
+    // Factor 2: recency weight (Ebbinghaus forgetting curve)
+    let recency = (-decay_rate * days_elapsed).exp().max(0.01);
+
+    // Factor 3: emotional amplification (amygdala effect)
+    let emotional_boost = 1.0 + emotional_charge.abs();
+
+    // Factor 4: identity alignment (self-schema)
+    let identity = identity_alignment;
+
+    // Factor 5: contradiction penalty
+    let contradiction_factor = if contradiction_flag { 0.5 } else { 1.0 };
+
+    // Multiplicative combination
+    semantic * recency * emotional_boost * identity * contradiction_factor
+}
+
+/// Compute identity alignment for an engram
+pub async fn compute_identity_alignment(
+    client: &Client,
+    engram_id: u64,
+) -> Result<f64, Box<dyn std::error::Error>> {
+    // 1. Get engram → concepts → identity chain
+    let chain_request = get_cognitive_chain(engram_id);
+    let chain_response = client.query(chain_request).send().await?;
+
+    // 2. Compute alignment between engram concepts and identity traits
+    // (cosine similarity between embeddings, weighted by trait value and stability)
+    // ...
+
+    Ok(alignment_score)
+}
 ```
-Input features:
-  - semantic_similarity
-  - days_elapsed
-  - |emotional_charge|
-  - identity_alignment
-  - contradiction_flag
-  - activation_count (how often recalled in the past)
-  - engram_type (episodic vs semantic vs procedural)
 
-Label:
-  - Did the user engage with this memory? (yes/no)
-  - Did the user reference it later? (yes/no)
-  - Did the user explicitly mark it as "important" or "irrelevant"?
+### Where Personalization Actually Happens
 
-Model:
-  - XGBoost or small neural network
-  - Trained on your own interaction data over time
-  - Outputs a single resonance score
+| Component | What It Personalizes | How |
+|-----------|---------------------|-----|
+| **Stimulation Layer** (doc 07) | How activation spreads through the graph | 9 learnable α weights (Adam optimizer) |
+| **Resonance Scorer** (this doc) | Nothing — it's deterministic | Pure math formula |
+| **Learnable Edge Weights** (doc 08) | YOUR retrieval dynamics | Real-time SGD from usage feedback |
 
-→ The AI learns what YOU consider relevant, not what a formula says
-```
-
-This is Phase 2+ material — the multiplicative formula is Phase 1.
+The Resonance Scorer stays simple and explainable. The Stimulation Layer's learnable weights handle personalization.
 
 ---
 
@@ -295,3 +326,17 @@ This is Phase 2+ material — the multiplicative formula is Phase 1.
 | A document from 3 years ago about depression-era economics has same retrieval chance as one about your current project | Recency weight naturally deprioritizes old knowledge unless it's identity-critical or frequently activated |
 | All chunks are equal | Emotional memories get up to 2× boost |
 | No contradiction handling | Contradicted memories are suppressed until resolved |
+
+---
+
+## Implementation
+
+For the actual Rust DSL implementation of queries mentioned in this doc, see:
+- [Query Reference](../helixdb-embedded-queries.md)
+- [Full Pipeline](../helixdb-embedded-pipeline.rs)
+- [Retrieval Layer](../helixdb-embedded-retrieval.md)
+- [Schema Definition](../helixdb-embedded-schema.md)
+
+For personalization (learnable edge weights that adapt to user), see:
+- [07-Stimulation-Layer.md](./07-Stimulation-Layer.md) — spreading activation with learnable weights
+- [08-Learnable-Edge-Weights.md](./08-Learnable-Edge-Weights.md) — Adam optimizer implementation

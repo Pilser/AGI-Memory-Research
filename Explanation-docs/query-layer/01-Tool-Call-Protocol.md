@@ -62,31 +62,54 @@ Parameters:
 
 When the agent calls `recall`, the CTP runtime:
 
+```rust
+// Step 1: Compute query embedding client-side
+let query_embedding: Vec<f32> = embed(&parameters.query);
+
+// Step 2: Vector search on Engram directly (no EngramVector + HasVector traversal)
+let search_request = search_engrams_full(
+    query_embedding,
+    parameters.limit * 2,   // oversample for resonance scoring
+    0.15,                   // min_importance
+);
+let search_response = client.query(search_request).send().await?;
+let candidates: Vec<EngramData> = serde_json::from_value(
+    search_response["candidates"].clone()
+)?;
+
+// Step 3: Fetch identity traits for resonance scoring
+let identity_request = get_all_identity();
+let identity_response = client.query(identity_request).send().await?;
+let identities: Vec<IdentityData> = serde_json::from_value(
+    identity_response["traits"].clone()
+)?;
+
+// Step 4: Score each candidate with CRR resonance formula
+let mut scored: Vec<ScoredEngram> = candidates.iter().map(|engram| {
+    let semantic_sim = 1.0 - engram.$distance;  // from vector search
+    let recency_weight = compute_recency(&engram.timestamp);
+    let emotional_boost = engram.emotional_charge.abs();
+    let identity_alignment = compute_alignment(engram, &identities);
+    let contradiction_penalty = if engram.contradiction_flag { 0.5 } else { 1.0 };
+
+    let resonance = semantic_sim * recency_weight * (1.0 + emotional_boost)
+        * identity_alignment * contradiction_penalty;
+
+    ScoredEngram { engram, resonance }
+}).collect();
+
+// Step 5: Sort by resonance, take top(limit)
+scored.sort_by(|a, b| b.resonance.partial_cmp(&a.resonance).unwrap());
+let top_results: Vec<_> = scored.into_iter().take(parameters.limit as usize).collect();
+
+// Step 6: Format as natural memory snippets (NOT raw JSON)
+let formatted = format_memories(&top_results);
+
+// Step 7: Inject into agent context as a hidden tool response
+inject_into_context(formatted);
 ```
-1. search_result = SearchEngramsFull(
-       query=parameters.query,
-       limit=parameters.limit * 2,      // oversample for resonance scoring
-       min_importance=0.15,
-       exclude_contradictions=true
-   )
 
-2. identities = GetAllIdentity()
-
-3. For each candidate:
-       resonance = compute_resonance(       // our existing formula
-           semantic_sim,
-           recency_weight,
-           emotional_boost,
-           identity_alignment(engram, identities),
-           contradiction_penalty
-       )
-
-4. Sort by resonance, take top(limit)
-
-5. Format as natural memory snippet (NOT raw JSON)
-
-6. Inject into agent context as a hidden tool response
-```
+**Key simplification:** Vector search uses `g().vector_search_with("Engram", "embedding", ...)` which returns `Engram` nodes directly. No `::In<HasVector>` traversal needed — the embedding lives on the `Engram` node itself.
 
 ### Formatted Output (what the agent sees)
 
@@ -131,37 +154,76 @@ Parameters:
 
 ### Internal Implementation
 
+```rust
+// Step 1: Score importance
+let importance_score = if parameters.importance == "auto" {
+    importance_scorer.score(&parameters.content)
+} else {
+    match parameters.importance.as_str() {
+        "low" => 0.2,
+        "medium" => 0.5,
+        "high" => 0.85,
+        _ => 0.5,
+    }
+};
+
+// Step 2: Tag emotional charge
+let emotional_charge = emotional_tagger.tag(&parameters.content);
+
+// Step 3: Compute embedding (client-side)
+let embedding: Vec<f32> = embed(&parameters.content);
+
+// Step 4: CreateFullEngram — ONE step, embedding stored directly on Engram node
+// No separate EngramVector node, no HasVector edge needed
+let create_request = create_full_engram(
+    parameters.content.clone(),  // episode_raw
+    emotional_charge,
+    importance_score,
+    0.05,                        // decay_rate
+    parameters.type.clone().unwrap_or_else(|| "episodic".to_string()),
+    0,                           // compression_level
+    false,                       // contradiction_flag
+    embedding,                   // stored directly on Engram.embedding
+);
+let create_response = client.query(create_request).send().await?;
+let engram_id: u64 = serde_json::from_value(
+    create_response["engram"]["$id"].clone()
+)?;
+
+// Step 5: Extract concepts and link
+let concepts = concept_extractor.extract(&parameters.content);
+for concept in concepts {
+    let existing_request = get_concept_by_name(concept.name.clone());
+    let existing_response = client.query(existing_request).send().await?;
+
+    let concept_id: u64 = if !existing_response["concept"].is_null() {
+        serde_json::from_value(existing_response["concept"]["$id"].clone())?
+    } else {
+        let create_concept_request = create_concept(
+            concept.name,
+            concept.confidence,
+        );
+        let create_concept_response = client.query(create_concept_request).send().await?;
+        serde_json::from_value(create_concept_response["concept"]["$id"].clone())?
+    };
+
+    let recalls_request = connect_recalls(engram_id, concept_id);
+    client.query(recalls_request).send().await?;
+
+    let abstraction_request = connect_abstraction(engram_id, concept_id);
+    client.query(abstraction_request).send().await?;
+
+    // Update source count (read current, then set)
+    let current_count = get_source_count(concept_id).await?;
+    let update_request = update_concept_source_count(concept_id, current_count + 1);
+    client.query(update_request).send().await?;
+}
+
+// Step 6: Check for contradictions
+contradiction_detector.check_new_engram(engram_id).await?;
 ```
-1. If importance == "auto":
-       importance_score = ImportanceScorer.score(content)
-   else:
-       importance_score = map("low"→0.2, "medium"→0.5, "high"→0.85)
 
-2. emotional_charge = EmotionalTagger.tag(content)
-
-3. engram_id = CreateFullEngram(
-       episode_raw=content,
-       emotional_charge=emotional_charge,
-       importance_score=importance_score,
-       decay_rate=0.05,
-       engram_type=parameters.type or "episodic",
-       compression_level=0,
-       contradiction_flag=false
-   )
-
-4. concepts = ConceptExtractor.extract(content)
-   For each concept:
-       existing = GetConceptByName(concept.name)
-       if existing: concept_id = existing.id
-       else: concept_id = CreateConcept(concept.name, concept.confidence)
-
-       ConnectRecalls(engram_id, concept_id)
-       ConnectAbstraction(engram_id, concept_id)
-       UpdateConceptSourceCount(concept_id)
-
-5. ContradictionDetector.check_new_engram(engram_id)
-   (checks if this engram contradicts existing ones about same concepts)
-```
+**Key simplification:** `create_full_engram()` creates the `Engram` node with the `embedding` property in a single `add_n("Engram", ...)` call. No separate `EngramVector` node creation, no `HasVector` edge. The old 3-step process (create engram → create vector → connect with edge) is now 1 step.
 
 ### When the Agent Should Store
 
@@ -192,25 +254,57 @@ Parameters:
 
 ### Internal Implementation
 
-```
-1. SearchEngramsFull(query=claim, limit=5, exclude_contradictions=false)
+```rust
+// Step 1: Compute claim embedding
+let claim_embedding: Vec<f32> = embed(&parameters.claim);
 
-2. For each candidate with emotional_charge opposite sign to the claim's tone:
-       embedding_sim = cosine(claim_embedding, candidate_embedding)
-       if embedding_sim > 0.7:
-           contradictions.push(candidate)
+// Step 2: Vector search on Engram directly (no traversal needed)
+let search_request = search_engrams_full(
+    claim_embedding,
+    5,       // limit
+    0.0,     // min_importance — include all for contradiction check
+);
+let search_response = client.query(search_request).send().await?;
+let candidates: Vec<EngramData> = serde_json::from_value(
+    search_response["candidates"].clone()
+)?;
 
-3. If contradictions found:
-       Return formatted contradiction report
-   Else:
-       Return empty (no conflict)
+// Step 3: Detect contradictions
+let claim_tone = emotional_tagger.tag(&parameters.claim);
+let mut contradictions: Vec<EngramData> = Vec::new();
+
+for candidate in &candidates {
+    // Check for opposite emotional charge (sign flip)
+    if candidate.emotional_charge.signum() == -claim_tone.signum() {
+        // Embedding similarity — both embeddings on Engram nodes directly
+        let embedding_sim = cosine_similarity(
+            &claim_embedding,
+            &candidate.embedding,  // direct access, no traversal
+        );
+        if embedding_sim > 0.7 {
+            contradictions.push(candidate.clone());
+        }
+    }
+}
+
+// Step 4: Return formatted report or empty
+if contradictions.is_empty() {
+    return Ok(ContradictionReport::empty());
+}
+
+Ok(ContradictionReport {
+    found: true,
+    conflicts: contradictions,
+})
 ```
+
+**Key simplification:** Both the query embedding and candidate embeddings are accessed directly on `Engram` nodes. No `::In<HasVector>` traversal to reach a separate `EngramVector` node — the embedding is right there on the candidate.
 
 ### Example
 
 ```
 Agent (thinking): "I should tell the user that managed cloud is the
-                   right choice here."
+                    right choice here."
 
 Agent: contradiction_check("managed cloud services are the best choice
                             for this project")
@@ -223,9 +317,9 @@ Memory returns:
      Session: 2024-11. Emotional charge: 0.68. Importance: 0.87.
 
 Agent (now aware): "While managed cloud is simpler operationally,
-                    you've previously emphasized that owning the stack
-                    is important for strategic control. Does that still
-                    hold for this project?"
+                     you've previously emphasized that owning the stack
+                     is important for strategic control. Does that still
+                     hold for this project?"
 ```
 
 ---
@@ -248,32 +342,87 @@ Parameters: None required. Accepts optional overrides:
 
 ### Internal Implementation
 
+```rust
+// Step 1: Baseline metrics
+let baseline_request = get_memory_stats();
+let baseline_response = client.query(baseline_request).send().await?;
+let baseline: MemoryStats = serde_json::from_value(baseline_response)?;
+
+// Step 2: Decay pass
+let engrams_request = get_engrams_for_decay_check("episodic".to_string());
+let engrams_response = client.query(engrams_request).send().await?;
+let engrams: Vec<EngramData> = serde_json::from_value(
+    engrams_response["engrams"].clone()
+)?;
+
+let mut pruned = 0;
+let mut compressed = 0;
+let mut promoted = 0;
+
+for engram in &engrams {
+    let days = days_since(&engram.timestamp);
+    let retention = (-engram.decay_rate * days as f64
+        / ((engram.activation_count as f64 + 1.0).sqrt())).exp();
+
+    if retention < 0.05 && engram.importance_score < 0.1 {
+        // PruneEngram — single drop, no vector cascade needed
+        // (embedding is on the Engram node itself, so dropping the
+        //  node removes everything — no separate EngramVector to clean up)
+        let prune_request = prune_engram(engram.$id);
+        client.query(prune_request).send().await?;
+        pruned += 1;
+    } else if retention < 0.15 && engram.importance_score < 0.3 {
+        let compress_request = compress_engram(engram.$id);
+        client.query(compress_request).send().await?;
+        compressed += 1;
+    } else if retention > 0.8 && engram.activation_count > 20 {
+        let promote_request = promote_to_semantic(engram.$id);
+        client.query(promote_request).send().await?;
+        promoted += 1;
+    }
+}
+
+// Step 3: If aggressive mode
+if parameters.aggressive.unwrap_or(false) {
+    // Mitosis pass
+    let mitosis_request = check_mitosis_candidates(10);
+    let mitosis_response = client.query(mitosis_request).send().await?;
+    let overloaded_concepts: Vec<ConceptData> = serde_json::from_value(
+        mitosis_response["concepts"].clone()
+    )?;
+    for concept in overloaded_concepts {
+        cluster_and_split(concept).await?;
+    }
+
+    // Contradiction pass
+    let contradicted_request = get_contradicted_engrams();
+    let contradicted_response = client.query(contradicted_request).send().await?;
+    let contradicted: Vec<EngramData> = serde_json::from_value(
+        contradicted_response["engrams"].clone()
+    )?;
+    for engram in contradicted {
+        resolve_contradictions(engram).await?;
+    }
+
+    // Identity pass
+    crystallize_identity_traits().await?;
+}
+
+// Step 4: Compare to baseline
+let final_request = get_memory_stats();
+let final_response = client.query(final_request).send().await?;
+let final_stats: MemoryStats = serde_json::from_value(final_response)?;
+
+// Step 5: Return summary
+Ok(ConsolidationResult {
+    pruned,
+    compressed,
+    promoted,
+    contradictions_found: final_stats.contradictions - baseline.contradictions,
+})
 ```
-1. GetMemoryStats() → baseline metrics
 
-2. Decay pass:
-       engrams = GetEngramsForDecayCheck("episodic")
-       For each engram:
-           retention = exp(-decay_rate * days / sqrt(activation_count + 1))
-           if retention < 0.05 && importance < 0.1: PruneEngram(id)
-           elif retention < 0.15 && importance < 0.3: CompressEngram(id)
-           elif retention > 0.8 && activation_count > 20: PromoteToSemantic(id)
-
-3. If aggressive:
-       Mitosis pass:
-           concepts = CheckMitosisCandidates(min=10)
-           For each concept: cluster and split (see Memory Mitosis Splitter)
-
-       Contradiction pass:
-           For each concept: scan for opposing engrams, create Contradicts edges
-
-       Identity pass:
-           Crystallize strong concepts into identity traits
-
-4. GetMemoryStats() → compare to baseline
-
-5. Return: { pruned: N, compressed: N, promoted: N, contradictions_found: N, ... }
-```
+**Key simplification:** `prune_engram()` is a single `g().n(NodeRef::id(id)).drop()` — no vector cascade needed. Since the embedding lives directly on the `Engram` node, dropping the node removes everything. The old design required cascading deletes to also remove the separate `EngramVector` node and `HasVector` edge.
 
 ### When to Call It
 
@@ -324,17 +473,17 @@ Agent (internal): contradiction_check("We should switch databases")
 Memory returns: [CONTRADICTION] Previous decision was to stay with Postgres
 
 Agent: "Looking at our history, we moved from MongoDB to Postgres after
-       consistency issues. You were pretty firm about sticking with Postgres
-       for reliability. Has something changed?"
+        consistency issues. You were pretty firm about sticking with Postgres
+        for reliability. Has something changed?"
 
 User: "No, you're right. I forgot about that. Let's keep Postgres.
-      But we need better query monitoring."
+       But we need better query monitoring."
 
 Agent (internal): store("User confirmed staying with Postgres. New
-                         requirement: better query monitoring.", "medium")
+                          requirement: better query monitoring.", "medium")
 
 Agent: "Good call. I'll remember that we're committed to Postgres but
-       need monitoring improvements. What specific metrics matter most?"
+        need monitoring improvements. What specific metrics matter most?"
 
 --- Session ends ---
 

@@ -8,12 +8,43 @@ A **Concept** is an abstracted piece of knowledge extracted from one or more eng
 
 ## Schema
 
-    N::Concept {
-        name:              String,      // Human-readable concept name
-        confidence:        F32,         // How strongly the system believes this concept (0.0–1.0)
-        formation_date:    Date,        // When this concept was first created
-        source_count:      U32          // How many engrams feed into this concept
-    }
+### Base Schema
+
+```rust
+g().add_n("Concept", vec![
+    ("name", name),                         // String
+    ("confidence", confidence),             // F64 — 0.0 to 1.0
+    ("formation_date", formation_date),     // String (RFC 3339 date-time)
+    ("source_count", source_count),         // I64 — number of linked engrams
+])
+```
+
+### Optional Enhancement: Centroid Embedding
+
+> **This is an OPTIONAL enhancement that improves functionality without degrading anything.**
+> Store a centroid embedding on Concept nodes to enable concept-level vector search and faster mitosis decisions.
+
+```rust
+g().add_n("Concept", vec![
+    ("name", name),                         // String
+    ("confidence", confidence),             // F64 — 0.0 to 1.0
+    ("formation_date", formation_date),     // String (RFC 3339 date-time)
+    ("source_count", source_count),         // I64 — number of linked engrams
+    ("embedding", centroid_embedding),      // Vec<f32> — OPTIONAL centroid of all recalling engrams
+])
+```
+
+**How it works:**
+- After mitosis creates child concepts, compute the centroid (average) of all engrams' embeddings that recall each child
+- Store that centroid on the Concept node
+- Update the centroid whenever engrams are added/removed from a concept
+
+**Benefits (no degradation):**
+- **CRR:** Can search concepts first as a pre-filter, then drill down to engrams
+- **Mitosis:** Faster decisions — compare concept centroids instead of re-clustering all engrams
+- **Stimulation Layer:** Can seed activation from concepts AND engrams simultaneously
+
+**Cost:** Extra computation to maintain centroids (update on engram assignment changes)
 
 ---
 
@@ -25,19 +56,24 @@ A **Concept** is an abstracted piece of knowledge extracted from one or more eng
 | `confidence` | Concept Extractor (ML) | Initial confidence from extraction. Can be boosted over time as more engrams reinforce it or lowered when contradictions emerge. |
 | `formation_date` | System (`NOW`) | Set at creation. Used to track when the AI "learned" this concept. |
 | `source_count` | `UpdateConceptSourceCount` query | Incremented every time a new engram links to this concept. High source_count → concept is well-supported. Triggers mitosis when above threshold. |
+| `embedding` (optional) | Consolidation Loop | Centroid of all engram embeddings that recall this concept. Updated when engrams are assigned/reassigned. Enables concept-level vector search. |
 
 ---
 
 ## Outgoing Edges (What a Concept Can Point To)
 
-    Concept ──Defines────────→ Identity      (this concept shapes an identity trait)
-    Concept ──SpawnedFrom────← Concept       (parent concept spawned this child via mitosis — incoming)
+```
+Concept ──Defines────────→ Identity      (this concept shapes an identity trait)
+```
 
 ## Incoming Edges (What Points to a Concept)
 
-    Engram  ──Recalls────────→← Concept      (engrams recall this concept)
-    Engram  ──AbstractsTo────→← Concept      (engrams feed into this concept)
-    Concept ──SpawnedFrom────→ Concept       (this is a child of a parent concept)
+```
+Engram  ──Recalls────────→← Concept      (engrams recall this concept)
+Engram  ──AbstractsTo────→← Concept      (engrams feed into this concept)
+Concept ──SpawnedFrom────→ Concept       (this is a child of a parent concept)
+Concept ──SpawnedFrom────← Concept       (parent concept spawned this child via mitosis)
+```
 
 ---
 
@@ -52,50 +88,55 @@ A **Concept** is an abstracted piece of knowledge extracted from one or more eng
 | **Identity formation** | Concepts with high confidence and source_count become identity traits via `Defines` edges |
 | **Contradiction grouping** | Engrams about the same concept are compared for contradictory emotional charges |
 | **Semantic browsing** | Users or AI agents can query concepts by name to explore the knowledge graph |
+| **Concept-level vector search** | (Optional) Search concepts directly by semantic similarity using centroid embedding |
 
 ---
 
 ## Lifecycle
 
-    1. Engram ingested → Concept Extractor extracts concepts from text
-    2. For each concept: check GetConceptByName(name) → exists?
-       YES → reuse existing concept, increment source_count
-       NO  → create new Concept node with source_count=1
+```
+1. Engram ingested → Concept Extractor extracts concepts from text
+2. For each concept: check GetConceptByName(name) → exists?
+   YES → reuse existing concept, increment source_count
+   NO  → create new Concept node with source_count=1
 
-    3. As more engrams arrive:
-       source_count grows → confidence increases (more evidence)
-       source_count exceeds threshold → MITOSIS triggers → child concepts spawn
+3. As more engrams arrive:
+   source_count grows → confidence increases (more evidence)
+   source_count exceeds threshold → MITOSIS triggers → child concepts spawn
 
-    4. If contradictions are detected among engrams of this concept:
-       confidence may decrease
-       concept may split to resolve the contradiction
+4. If contradictions are detected among engrams of this concept:
+   confidence may decrease
+   concept may split to resolve the contradiction
 
-    5. If source_count stays at 1 and no new engrams link → concept atrophies
-       (no explicit prune — orphan concepts just have no incoming edges)
+5. If source_count stays at 1 and no new engrams link → concept atrophies
+   (no explicit prune — orphan concepts just have no incoming edges)
+```
 
 ---
 
 ## Concept Formation Example
 
-    Engram 1: "The Uganda ICT Hub in Kampala is attracting VC"
-      → extracts concept: "Uganda ICT Hub" (source_count = 1)
+```
+Engram 1: "The Uganda ICT Hub in Kampala is attracting VC"
+  → extracts concept: "Uganda ICT Hub" (source_count = 1)
 
-    Engram 2: "Visited Uganda ICT Hub, they have 50+ startups in residence"
-      → same concept found → source_count = 2
+Engram 2: "Visited Uganda ICT Hub, they have 50+ startups in residence"
+  → same concept found → source_count = 2
 
-    Engram 3: "Uganda ICT Hub just raised a $5M expansion fund"
-      → source_count = 3
+Engram 3: "Uganda ICT Hub just raised a $5M expansion fund"
+  → source_count = 3
 
-    ...after 47 more engrams about Uganda ICT Hub...
+...after 47 more engrams about Uganda ICT Hub...
 
-    source_count = 50 → ABOVE THRESHOLD → Mitosis triggers
+source_count = 50 → ABOVE THRESHOLD → Mitosis triggers
 
-    Clustering of 50 engram embeddings reveals 3 clusters:
-      → Child: "Uganda ICT Hub funding and investment"  (source_count = 22)
-      → Child: "Uganda ICT Hub startups and companies"   (source_count = 18)
-      → Child: "Uganda ICT Hub infrastructure"            (source_count = 10)
+Clustering of 50 engram embeddings reveals 3 clusters:
+  → Child: "Uganda ICT Hub funding and investment"  (source_count = 22)
+  → Child: "Uganda ICT Hub startups and companies"   (source_count = 18)
+  → Child: "Uganda ICT Hub infrastructure"            (source_count = 10)
 
-    Parent "Uganda ICT Hub" stays as general category → source_count adjusted
+Parent "Uganda ICT Hub" stays as general category → source_count adjusted
+```
 
 ---
 
@@ -113,26 +154,59 @@ A **Concept** is an abstracted piece of knowledge extracted from one or more eng
 
 ## Typical Query Patterns
 
-    -- Create concept
-    AddN<Concept>({name: name, confidence: conf, formation_date: NOW, source_count: 1})
+```rust
+// Create concept
+g().add_n("Concept", vec![
+    ("name", name),
+    ("confidence", confidence),
+    ("formation_date", formation_date),
+    ("source_count", 1_i64),
+])
 
-    -- Find concept by name (requires INDEX on name)
-    N<Concept>({name: name})
+// Create concept with optional centroid embedding
+g().add_n("Concept", vec![
+    ("name", name),
+    ("confidence", confidence),
+    ("formation_date", formation_date),
+    ("source_count", 1_i64),
+    ("embedding", centroid_embedding),
+])
 
-    -- Get engrams that recall this concept
-    N<Concept>(concept_id)::In<Recalls>
+// Find concept by name (requires INDEX on name)
+g().n(NodeRef::var("concept_id"))
+    .filter_node(PropertyFilter::property("name").eq(name))
 
-    -- Get identity traits this concept feeds into
-    N<Concept>(concept_id)::Out<Defines>
+// Get engrams that recall this concept
+g().n(NodeRef::var("concept_id"))
+    .in("Recalls")
 
-    -- Get children spawned from this concept (mitosis)
-    N<Concept>(concept_id)::In<SpawnedFrom>
+// Get identity traits this concept feeds into
+g().n(NodeRef::var("concept_id"))
+    .out("Defines")
 
-    -- Get parent concept (what this was spawned from)
-    N<Concept>(concept_id)::Out<SpawnedFrom>
+// Get children spawned from this concept (mitosis)
+g().n(NodeRef::var("concept_id"))
+    .in("SpawnedFrom")
 
-    -- Count engrams per concept
-    N<Concept>(concept_id)::In<Recalls>::COUNT
+// Get parent concept (what this was spawned from)
+g().n(NodeRef::var("concept_id"))
+    .out("SpawnedFrom")
 
-    -- Find concepts ready for mitosis
-    N<Concept>::WHERE(_::{source_count}::GTE(min_engram_count))
+// Count engrams per concept
+g().n(NodeRef::var("concept_id"))
+    .in("Recalls")
+    .count()
+
+// Find concepts ready for mitosis
+g().n(NodeRef::var("concept_id"))
+    .filter_node(PropertyFilter::property("source_count").gte(min_engram_count))
+
+// Optional: Vector search on concept centroid embedding
+// (requires vector index on Concept.embedding)
+g().vector_search_with(
+    "Concept",
+    "embedding",
+    query_embedding,
+    NonZeroUsize::new(10).expect("non-zero"),
+)
+```

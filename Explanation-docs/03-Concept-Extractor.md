@@ -32,18 +32,20 @@ Called once per extracted concept before creation, to avoid duplicates.
 ## DB Data It Writes
 
 ```
-QUERY: CreateConcept(name, confidence)
-QUERY: ConnectRecalls(engram_id, concept_id)
-QUERY: ConnectAbstraction(engram_id, concept_id)
-QUERY: UpdateConceptSourceCount(concept_id)
+QUERY: create_concept (Rust DSL #[query] function)
+QUERY: connect_recalls (Rust DSL #[query] function)
+QUERY: connect_abstraction (Rust DSL #[query] function)
+QUERY: update_concept_source_count (Rust DSL #[query] function)
 ```
 
 | Written | Node/Edge | Fields |
 |---|---|---|
-| New `Concept` node | `N::Concept` | `name`, `confidence`, `formation_date`, `source_count` |
-| `Recalls` edge | `E::Recalls` | `From: Engram, To: Concept` |
-| `AbstractsTo` edge | `E::AbstractsTo` | `From: Engram, To: Concept` |
-| Updated `source_count` | `N::Concept` | Incremented count of linked engrams |
+| New `Concept` node | `Concept` | `name`, `confidence`, `formation_date`, `source_count` |
+| `Recalls` edge | `Recalls` | `From: Engram, To: Concept` |
+| `AbstractsTo` edge | `AbstractsTo` | `From: Engram, To: Concept` |
+| Updated `source_count` | `Concept` | Incremented count of linked engrams |
+
+**Optional enhancement:** Use `connect_recalls_with_embedding` to store relationship embeddings on Recalls edges for dynamic Stimulation Layer weights.
 
 ---
 
@@ -122,9 +124,20 @@ Concepts enable:
 
 ---
 
-## Possible Model Types
+## Recommended Approach: LLM with Structured Output
 
-### Option A: LLM with structured output (OpenAI, Anthropic)
+> **This is the recommended approach.** Concepts become permanent parts of your knowledge structure — worth doing right. LLM extracts abstract concepts that simpler methods miss.
+
+### Why LLM?
+
+| Feature | Why It Matters |
+|---------|----------------|
+| **Abstract concepts** | Extracts "donor dependency narrative" — NER can't do this |
+| **Context understanding** | Knows "database" means different things in different contexts |
+| **Confidence scores** | Used for mitosis and contradiction detection |
+| **Implicit concepts** | Finds concepts not explicitly named in the text |
+
+### Implementation
 
 ```
 Prompt: "Extract key concepts, entities, and topics from this memory.
@@ -138,48 +151,44 @@ Prompt: "Extract key concepts, entities, and topics from this memory.
 
          Memory: {episode_raw}"
 
-Response model (Pydantic/JSON Schema):
+Response:
 {
   "concepts": [
     {"name": "Uganda ICT Hub", "confidence": 0.95},
-    ...
+    {"name": "Kampala tech ecosystem", "confidence": 0.88},
+    {"name": "Nairobi venture capital", "confidence": 0.82},
+    {"name": "East African tech independence", "confidence": 0.76},
+    {"name": "donor dependency narrative", "confidence": 0.70}
   ]
 }
 ```
 
-- **Pros:** Best quality, handles implicit concepts, understands context
-- **Cons:** Latency, cost, requires structured output parsing
-- **Best for:** Production, when concept quality is critical
+```rust
+/// Extract concepts from raw text using LLM
+pub async fn extract_concepts(
+    text: &str,
+) -> Result<Vec<ExtractedConcept>, Box<dyn std::error::Error>> {
+    let prompt = format!(
+        "Extract key concepts, entities, and topics from this memory.
+         Return a JSON array of objects with 'name' and 'confidence' fields.
 
-### Option B: NER + Keyphrase Extraction
+         Rules:
+         - Each concept should be a specific noun phrase (2-6 words)
+         - Avoid overly generic terms ('stuff', 'things')
+         - Include technical terms, proper nouns, and domain concepts
+         - Confidence should reflect how clearly the concept is stated
 
-- Use a Named Entity Recognition model (spaCy, HuggingFace NER)
-- Combine with keyphrase extraction (YAKE, TextRank, KeyBERT)
-- Merge and deduplicate
+         Memory: {}",
+        text
+    );
 
-- **Pros:** Fast, deterministic, good for proper nouns
-- **Cons:** Misses abstract concepts ("donor dependency narrative"), no confidence score
-- **Best for:** High-throughput, when concepts are mostly named entities
+    // Call LLM API and parse structured response
+    let response = llm_client.chat().create(/* ... */).await?;
+    let concepts: Vec<ExtractedConcept> = parse_concepts(&response)?;
 
-### Option C: Local LLM (llama.cpp, mistral.rs, Ollama)
-
-- Run a small LLM (Llama 3 8B, Mistral 7B, Phi-3) locally
-- Same prompt as Option A but fully local
-
-- **Pros:** Privacy, no API cost, decent quality
-- **Cons:** GPU/CPU requirements, slower than NER
-- **Best for:** Privacy-sensitive deployments, offline operation
-
-### Option D: Embedding clustering (batch, offline)
-
-- Embed all unprocessed engrams
-- Cluster embeddings (HDBSCAN)
-- Each cluster centroid → concept
-- This is a **retroactive** approach (not per-engram)
-
-- **Pros:** Finds implicit concepts that NER/LLM miss
-- **Cons:** Batch only, no real-time concept creation
-- **Best for:** Cold-start population of the concept graph from existing data
+    Ok(concepts)
+}
+```
 
 ---
 
@@ -218,3 +227,16 @@ This means the first engram about "Uganda ICT Hub" creates the concept. The 47th
 | 20+ concepts in one text | Cap at a reasonable max (e.g., 10). Trim by confidence score. |
 | Concept name too generic | LLM prompt instructs avoiding generic terms. As fallback, filter by minimum word count (≥2 words) or blacklist. |
 | Concept name already exists but different meaning | Risk of collision. Mitigated by also comparing engram context. Advanced: use concept embedding + cosine threshold alongside name match. |
+
+---
+
+## Implementation
+
+For the actual Rust DSL implementation of queries mentioned in this doc, see:
+- [Query Reference](../helixdb-embedded-queries.md)
+- [Full Pipeline](../helixdb-embedded-pipeline.rs)
+- [Schema Definition](../helixdb-embedded-schema.md)
+
+For how concepts are used in other algorithms, see:
+- [05-Memory-Mitosis-Splitter.md](./05-Memory-Mitosis-Splitter.md) — mitosis uses concepts
+- [04-Contradiction-Detector.md](./04-Contradiction-Detector.md) — contradiction detection uses concepts

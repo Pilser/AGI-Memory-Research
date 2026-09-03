@@ -8,12 +8,16 @@ An **Identity** node represents a stable, long-term trait or belief that defines
 
 ## Schema
 
-    N::Identity {
-        trait:          String,     // Trait label (e.g., "knows African tech", "prefers Rust")
-        value:          F32,        // How strongly the AI holds this trait (0.0–1.0)
-        stability:      F32,        // Resistance to change (0.0–1.0). Higher = harder to update.
-        last_updated:   Date        // When this trait was last modified
-    }
+```rust
+g().add_n("Identity", vec![
+    ("trait", trait_name),                  // String
+    ("value", value),                       // F64 — trait strength
+    ("stability", stability),               // F64 — resistance to change
+    ("last_updated", last_updated),         // String (RFC 3339 date-time)
+])
+```
+
+**Note on types:** The Rust DSL uses `i64` for integer properties (there's no `u32` or `u64` wire type — use `i64` and cast). Float properties accept `f64` values. Boolean accepts `bool`. String accepts `&str` or `String`.
 
 ---
 
@@ -30,15 +34,17 @@ An **Identity** node represents a stable, long-term trait or belief that defines
 
 ## Outgoing Edges
 
-    Identity ──Defines────────← Concept       (concept defines this identity trait — incoming)
-
 Identity nodes don't originate edges — they are *pointed to* by concepts. Identity is the terminal node in the cognitive chain:
 
-    Engram → Concept → Identity
+```
+Engram → Concept → Identity
+```
 
 ## Incoming Edges
 
-    Concept ──Defines────────→← Identity      (concepts define identity traits)
+```
+Concept ──Defines────────→← Identity      (concepts define identity traits)
+```
 
 ---
 
@@ -58,15 +64,19 @@ Identity nodes don't originate edges — they are *pointed to* by concepts. Iden
 
 When a concept's confidence and source_count are high enough, it can **crystallize** into an identity trait. The consolidation loop evaluates:
 
-    If concept.confidence > 0.7 AND concept.source_count > 20:
-        Create or update Identity{trait: concept.name, value: concept.confidence, stability: 0.5}
+```
+If concept.confidence > 0.7 AND concept.source_count > 20:
+    Create or update Identity{trait: concept.name, value: concept.confidence, stability: 0.5}
+```
 
 When new evidence arrives that affects an identity trait:
 
-    new_value = old_value * stability + evidence * (1 - stability)
+```
+new_value = old_value * stability + evidence * (1 - stability)
 
-    If the discrepancy is too large (|evidence - old_value| > 0.5) AND stability > 0.8:
-        Flag for contradiction resolution rather than automatic update.
+If the discrepancy is too large (|evidence - old_value| > 0.5) AND stability > 0.8:
+    Flag for contradiction resolution rather than automatic update.
+```
 
 This is the key mechanism: **the AI doesn't casually unlearn who it is.** A highly stable trait ("I believe remote work is productive," stability=0.9) requires overwhelming contradictory evidence to shift. A new trait ("I'm learning Rust," stability=0.3) updates easily.
 
@@ -76,36 +86,42 @@ This is the key mechanism: **the AI doesn't casually unlearn who it is.** A high
 
 **Example 1: Stable trait resist change**
 
-    Current Identity: {trait: "remote work is productive", value: 0.85, stability: 0.9}
+```
+Current Identity: {trait: "remote work is productive", value: 0.85, stability: 0.9}
 
-    New engram arrives: "Remote work destroyed our team's collaboration."
-    Emotional charge: -0.7
-    Concept extracted: "remote work productivity"
+New engram arrives: "Remote work destroyed our team's collaboration."
+Emotional charge: -0.7
+Concept extracted: "remote work productivity"
 
-    → Evidence suggests value should shift toward negative
-    → But stability is 0.9 → very resistant
-    → new_value = 0.85 * 0.9 + (-0.7 mapped to 0.1) * 0.1 = 0.775
-    → Small adjustment. One bad experience doesn't flip a strongly held belief.
+→ Evidence suggests value should shift toward negative
+→ But stability is 0.9 → very resistant
+→ new_value = 0.85 * 0.9 + (-0.7 mapped to 0.1) * 0.1 = 0.775
+→ Small adjustment. One bad experience doesn't flip a strongly held belief.
+```
 
 **Example 2: New trait forms easily**
 
-    Current Identity: {trait: "interested in Rust", value: 0.4, stability: 0.3}
+```
+Current Identity: {trait: "interested in Rust", value: 0.4, stability: 0.3}
 
-    New engram: "Just wrote my first Rust macro — it was elegant and powerful."
-    Emotional charge: +0.8
-    → new_value = 0.4 * 0.3 + 0.8 * 0.7 = 0.68
-    → Significant shift. New trait, low stability, strong evidence.
+New engram: "Just wrote my first Rust macro — it was elegant and powerful."
+Emotional charge: +0.8
+→ new_value = 0.4 * 0.3 + 0.8 * 0.7 = 0.68
+→ Significant shift. New trait, low stability, strong evidence.
+```
 
 **Example 3: Contradiction flagged, not resolved**
 
-    Current Identity: {trait: "AI safety is paramount", value: 0.95, stability: 0.95}
+```
+Current Identity: {trait: "AI safety is paramount", value: 0.95, stability: 0.95}
 
-    New engram: "Ship the feature without safety review, we have a deadline."
-    Emotional charge: -0.3 (stress)
-    → Evidence contradicts a core identity trait
-    → |0.95 - evidence| = large gap, stability = 0.95
-    → DON'T update. Flag for contradiction resolution.
-    → AI maintains integrity: it doesn't casually override its core values.
+New engram: "Ship the feature without safety review, we have a deadline."
+Emotional charge: -0.3 (stress)
+→ Evidence contradicts a core identity trait
+→ |0.95 - evidence| = large gap, stability = 0.95
+→ DON'T update. Flag for contradiction resolution.
+→ AI maintains integrity: it doesn't casually override its core values.
+```
 
 ---
 
@@ -121,35 +137,49 @@ This is the key mechanism: **the AI doesn't casually unlearn who it is.** A high
 
 ## Typical Query Patterns
 
-    -- Create identity trait
-    AddN<Identity>({trait: trait, value: value, stability: stability, last_updated: NOW})
+```rust
+// Create identity trait
+g().add_n("Identity", vec![
+    ("trait", trait_name),
+    ("value", value),
+    ("stability", stability),
+    ("last_updated", now),
+])
 
-    -- Get all identity traits
-    N<Identity>
+// Get all identity traits
+g().n(NodeRef::var("identity_id"))
 
-    -- Get concepts that define an identity trait
-    N<Identity>(identity_id)::In<Defines>
+// Get concepts that define an identity trait
+g().n(NodeRef::var("identity_id"))
+    .in("Defines")
 
-    -- Get identity traits shaped by a concept
-    N<Concept>(concept_id)::Out<Defines>
+// Get identity traits shaped by a concept
+g().n(NodeRef::var("concept_id"))
+    .out("Defines")
 
-    -- Get the full cognitive chain for an engram
-    N<Engram>(engram_id)::Out<Recalls>::Out<Defines>
+// Get the full cognitive chain for an engram
+g().n(NodeRef::var("engram_id"))
+    .out("Recalls")
+    .out("Defines")
 
-    -- Update identity trait with weighted blending
-    N<Identity>(identity_id)::UpsertN({
-        value: ADD(MUL(current_value, stability), MUL(new_value, SUB(1.0, stability))),
-        last_updated: NOW
-    })
+// Update identity trait with weighted blending
+g().n(NodeRef::var("identity_id"))
+    .update_node(vec![
+        ("value", new_blended_value),
+        ("last_updated", now),
+    ])
+```
 
 ---
 
 ## Trait Stability Progression Over Time
 
-     Month 1: stability = 0.3   — "I think I might like Rust"
-     Month 2: stability = 0.5   — "I'm getting comfortable with Rust"
-     Month 4: stability = 0.7   — "Rust is my preferred systems language"
-     Month 6: stability = 0.85  — "I am a Rust developer" (crystallized)
-     Month 12: stability = 0.95 — Core identity, extremely resistant to change
+```
+Month 1: stability = 0.3   — "I think I might like Rust"
+Month 2: stability = 0.5   — "I'm getting comfortable with Rust"
+Month 4: stability = 0.7   — "Rust is my preferred systems language"
+Month 6: stability = 0.85  — "I am a Rust developer" (crystallized)
+Month 12: stability = 0.95 — Core identity, extremely resistant to change
+```
 
 The stability value naturally increases as the trait persists without contradiction. A trait that survives 6+ months of new experiences without being contradicted becomes a core part of identity.

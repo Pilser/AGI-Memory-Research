@@ -31,12 +31,14 @@ Same as Emotional Tagger — no DB read. Runs purely on the input text.
 ## DB Data It Writes
 
 ```
-QUERY: CreateFullEngram
+QUERY: create_full_engram (Rust DSL #[query] function)
 ```
 
 | Field Written | Node | Type |
 |---|---|---|
-| `importance_score` | `N::Engram` | `F32` (range: 0.0 to 1.0) |
+| `importance_score` | `Engram` | `f64` (range: 0.0 to 1.0) |
+
+**Note:** `create_full_engram` now stores the embedding directly on the Engram node in a single atomic operation. No separate vector node or `HasVector` edge needed.
 
 ---
 
@@ -86,9 +88,20 @@ The model should consider these axes:
 
 ---
 
-## Possible Model Types
+## Recommended Approach: LLM-based Scoring
 
-### Option A: LLM-based (OpenAI, Anthropic, local LLM)
+> **This is the recommended approach.** Importance is subtle and context-dependent. LLM understands that "I had coffee with the CEO who wants to acquire us" is very different from "I had coffee."
+
+### Why LLM?
+
+| Feature | Why It Matters |
+|---------|----------------|
+| **Context understanding** | "Coffee" is trivial unless it's with the CEO |
+| **Stakes detection** | Understands career, health, relationship implications |
+| **Novelty judgment** | Knows if information is new or repetitive |
+| **Decision relevance** | Identifies memories that inform future decisions |
+
+### Implementation
 
 ```
 Prompt: "You are a memory importance scorer. Rate how important this
@@ -102,39 +115,30 @@ Prompt: "You are a memory importance scorer. Rate how important this
          Memory: {episode_raw}"
 ```
 
-- **Pros:** Best understanding of subtle importance cues, adapts to context
-- **Cons:** Latency, API cost
+```rust
+/// Score memory importance using LLM
+pub async fn score_importance(
+    text: &str,
+) -> Result<f64, Box<dyn std::error::Error>> {
+    let prompt = format!(
+        "You are a memory importance scorer. Rate how important this \
+         memory is for a personal AI to retain long-term. Consider:\n\
+         - Does it contain novel information?\n\
+         - Could it inform future decisions?\n\
+         - Are the stakes high?\n\
+         - Is it specific or generic?\n\
+         Return ONLY a float from 0.0 to 1.0.\n\n\
+         Memory: {}",
+        text
+    );
 
-### Option B: Custom classifier (ONNX / Candle)
+    // Call LLM API and parse float response
+    let response = llm_client.chat().create(/* ... */).await?;
+    let score: f64 = response.trim().parse()?;
 
-- Binary or regression model fine-tuned on labeled data
-- Input features: text embedding + emotional charge from previous step
-- Output: 0.0–1.0 float
-
-- **Pros:** Fast, cheap, private, consistent
-- **Cons:** Requires labeled training data
-
-### Option C: Heuristic rules + signals
-
-- Combine programmatic signals into a weighted score:
-  - Text length (very short = likely trivial)
-  - Presence of names, dates, numbers (specificity)
-  - Emotional charge magnitude from Tagger (proxy for stakes)
-  - Keyword matching against "important topics" list
-  - Whether it contains question marks (decisions pending)
-
-- **Pros:** Fastest, no model, transparent
-- **Cons:** Brittle, can't understand context
-
-### Option D: Reinforcement from usage
-
-- Start with a moderate default (e.g., 0.5)
-- Over time, boost importance of engrams that get **recalled** (high activation_count means the AI kept referencing it)
-- Boost importance of engrams whose concepts get **mitosis** (they spawned new knowledge)
-- This **retroactively** adjusts importance based on real usage signals
-
-- **Pros:** Self-improving, no labels needed
-- **Cons:** Cold-start problem for new engrams
+    Ok(score.clamp(0.0, 1.0))
+}
+```
 
 ---
 
@@ -145,3 +149,15 @@ Prompt: "You are a memory importance scorer. Rate how important this
 | **Emotional Tagger** | Runs *before* this model. High emotional charge often (but not always) correlates with high importance. The importance model can use the tagger's output as an input feature. |
 | **Resonance Scorer** | Uses `importance_score` as a **filter threshold** — only engrams above `min_importance` enter the candidate pool. Does NOT use it in the multiplicative formula (importance already controlled via filter). |
 | **Consolidation Loop** | Uses `importance_score` to decide prune vs. compress vs. promote. This is the **life-or-death** field for engrams. |
+
+---
+
+## Implementation
+
+For the actual Rust DSL implementation of queries mentioned in this doc, see:
+- [Query Reference](../helixdb-embedded-queries.md)
+- [Full Pipeline](../helixdb-embedded-pipeline.rs)
+- [Schema Definition](../helixdb-embedded-schema.md)
+
+For how importance scores are used in retrieval, see:
+- [06-Resonance-Scorer.md](./06-Resonance-Scorer.md) — importance filters retrieval candidates

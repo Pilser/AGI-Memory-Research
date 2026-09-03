@@ -67,9 +67,20 @@ This value becomes a permanent field on the engram node and is used later by:
 
 ---
 
-## Possible Model Types
+## Recommended Approach: LLM-based Scoring
 
-### Option A: LLM-based (OpenAI, Anthropic, local LLM)
+> **This is the recommended approach.** Emotional tagging needs to understand sarcasm, context, and nuance. LLM is the only option that handles all three.
+
+### Why LLM?
+
+| Feature | Why It Matters |
+|---------|----------------|
+| **Sarcasm detection** | "Oh great, another meeting" → -0.6 (not +0.8) |
+| **Context understanding** | "I finally solved the bug" → positive relief, not just "bug = negative" |
+| **Nuance** | "Bittersweet farewell" → mixed, not just positive or negative |
+| **Emotional weight** | Understands humiliation vs disappointment vs mild inconvenience |
+
+### Implementation
 
 ```
 Prompt: "Score the emotional valence of this text from -1.0 (very negative)
@@ -78,33 +89,25 @@ Prompt: "Score the emotional valence of this text from -1.0 (very negative)
          Text: {episode_raw}"
 ```
 
-- **Pros:** Highest accuracy, understands nuance, context, sarcasm
-- **Cons:** Latency (~200-500ms), API cost if using cloud
-- **Best for:** Production system where accuracy matters
+```rust
+/// Score emotional valence using LLM
+pub async fn tag_emotion(
+    text: &str,
+) -> Result<f64, Box<dyn std::error::Error>> {
+    let prompt = format!(
+        "Score the emotional valence of this text from -1.0 (very negative) \
+         to +1.0 (very positive). Return only the number.\n\n\
+         Text: {}",
+        text
+    );
 
-### Option B: Custom fine-tuned transformer (ONNX / Candle)
+    // Call LLM API and parse float response
+    let response = llm_client.chat().create(/* ... */).await?;
+    let score: f64 = response.trim().parse()?;
 
-- Start with a pre-trained model (`distilbert-base-uncased`, `roberta-base`)
-- Fine-tune on your own labeled emotion data
-- Export to ONNX, run via `ort` crate in Rust
-
-- **Pros:** Fast (5-20ms), no API cost, runs locally, full control
-- **Cons:** Need labeled training data, lower ceiling than GPT-4
-- **Best for:** High-throughput systems, privacy-sensitive deployments
-
-### Option C: Lexicon/heuristic based
-
-- Use a sentiment lexicon (VADER, AFINN, NRC Emotion Lexicon) adapted to Rust
-- Count positive/negative words, compute ratio
-
-- **Pros:** Zero latency, no model loading, no dependencies
-- **Cons:** Low accuracy, no contextual understanding, sarcasm fails completely
-- **Best for:** Prototyping, as fallback, or as baseline to compare against
-
-### Option D: Hybrid
-
-- Lexicon-based for fast first pass
-- If confidence is low (e.g., ambiguous text), fall back to LLM
+    Ok(score.clamp(-1.0, 1.0))
+}
+```
 
 ---
 
@@ -117,3 +120,16 @@ Prompt: "Score the emotional valence of this text from -1.0 (very negative)
 | Sarcasm: "Oh great, another meeting." | Lexicon says +0.8 (word "great"). LLM says -0.6. Choose LLM. |
 | Mixed emotions: "Bittersweet farewell party" | Returns near-zero or slightly positive/negative depending on model nuance |
 | Very short text: "No." | Context-dependent; LLM may flag low confidence |
+
+---
+
+## Implementation
+
+For the actual Rust DSL implementation of queries mentioned in this doc, see:
+- [Query Reference](../helixdb-embedded-queries.md)
+- [Full Pipeline](../helixdb-embedded-pipeline.rs)
+- [Schema Definition](../helixdb-embedded-schema.md)
+
+For how emotional charge is used in other algorithms, see:
+- [06-Resonance-Scorer.md](./06-Resonance-Scorer.md) — emotional amplification in CRR
+- [04-Contradiction-Detector.md](./04-Contradiction-Detector.md) — opposite emotions trigger contradictions
